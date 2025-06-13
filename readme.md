@@ -35,6 +35,6 @@ sudo apt install git
 git config --global user.name "Your Name"
 git config --global user.email "your@email.com"
 #clone git repository:
-git clone https://github.com/username/repository.git
+git clone https://github.com/meetsang/spx-bot
 This downloads the repo to your current directory.
 
