@@ -25,7 +25,16 @@ git commit -m "Your message"
 git push                 # Upload to GitHub
 
 #pull changes: 
-#install virtual env: 
-
-
+#install and create virtual env: 
+python3 -m venv spx-bot
+source spx-bot/bin/activate
+#install git: 
+sudo apt update
+sudo apt install git
+#configure git:
+git config --global user.name "Your Name"
+git config --global user.email "your@email.com"
+#clone git repository:
+git clone https://github.com/username/repository.git
+This downloads the repo to your current directory.
 
