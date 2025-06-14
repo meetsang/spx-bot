@@ -24,10 +24,8 @@ git add .                # Stage all changes
 git commit -m "Your message"
 git push                 # Upload to GitHub
 
-#pull changes: 
-#install and create virtual env: 
-python3 -m venv spx-bot
-source spx-bot/bin/activate
+#pull changes:
+
 #install git: 
 sudo apt update
 sudo apt install git
@@ -37,4 +35,45 @@ git config --global user.email "your@email.com"
 #clone git repository:
 git clone https://github.com/meetsang/spx-bot
 This downloads the repo to your current directory.
+
+********USING UV TO SET UP A NEW ENV: *******
+## 1. Install uv on Your New Cloud Machine
+
+```bash
+# Install uv (much faster than Poetry's installer)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Reload your shell
+source ~/.bashrc
+```
+
+## 2. Clone and Set Up Your Project
+
+```bash
+# Clone your project
+git clone <your-repo-url>
+cd your-project-name
+```
+
+## 3. Initialize with uv (Super Simple)
+
+```bash
+# Create virtual environment and install from requirements.txt in one command
+uv venv
+
+# Activate the virtual environment
+source .venv/bin/activate  # Linux/Mac
+# or
+.venv\Scripts\activate     # Windows
+
+# Install all dependencies from requirements.txt
+uv pip install -r requirements.txt
+```
+
+## Even Simpler - One Command Setup
+
+```bash
+# This creates venv AND installs requirements in one go
+uv pip install -r requirements.txt
+```
 
