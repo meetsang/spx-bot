@@ -24,19 +24,8 @@ git add .                # Stage all changes
 git commit -m "Your message"
 git push                 # Upload to GitHub
 
-#pull changes:
 
-#install git: 
-sudo apt update
-sudo apt install git
-#configure git:
-git config --global user.name "Your Name"
-git config --global user.email "your@email.com"
-#clone git repository:
-git clone https://github.com/meetsang/spx-bot
-This downloads the repo to your current directory.
-
-********USING UV TO SET UP A NEW ENV: *******
+********USING UV TO SET UP ON A NEW MACHINE: *******
 ## 1. Install uv on Your New Cloud Machine
 
 ```bash
@@ -51,14 +40,15 @@ source ~/.bashrc
 
 ```bash
 # Clone your project
-git clone <your-repo-url>
-cd your-project-name
+git clone https://github.com/meetsang/spx-bot
+cd spx-bot
+# This downloads the repo to your current directory.
 ```
 
-## 3. Initialize with uv (Super Simple)
+# 3. Initialize with uv (Super Simple)
 
 ```bash
-# Create virtual environment and install from requirements.txt in one command
+# Create virtual environment
 uv venv
 
 # Activate the virtual environment
@@ -70,10 +60,5 @@ source .venv/bin/activate  # Linux/Mac
 uv pip install -r requirements.txt
 ```
 
-## Even Simpler - One Command Setup
 
-```bash
-# This creates venv AND installs requirements in one go
-uv pip install -r requirements.txt
-```
 
