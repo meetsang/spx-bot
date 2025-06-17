@@ -71,7 +71,7 @@ to check logs: nano Data/2025-06-17/spx.csv
 to kill: pkill -f main.py
 
 # 4. Running Automated:
-Key: startup-script Value:
+Put following in startup section:
 #!/bin/bash
 cd /home/YOUR_USERNAME/myprojects/spx-bot
 source .venv/bin/activate
