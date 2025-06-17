@@ -59,7 +59,7 @@ source .venv/bin/activate  # Linux/Mac
 # Install all dependencies from requirements.txt
 uv pip install -r requirements.txt
 ```
-# 4. Running
+# 4. Running Manually:
 cd myprojects/spx-bot
 
 source .venv/bin/activate
@@ -67,5 +67,15 @@ source .venv/bin/activate
 python main.py > /var/log/main.log 2>&1 &
 
 to check logs: nano Data/2025-06-17/spx.csv
+
+to kill: pkill -f main.py
+
+#5 Running Automated:
+Key: startup-script Value:
+#!/bin/bash
+cd /home/YOUR_USERNAME/myprojects/spx-bot
+source .venv/bin/activate
+nohup python main.py > /var/log/main.log 2>&1 &
+
 
 
