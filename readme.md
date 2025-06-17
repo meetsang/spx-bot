@@ -59,6 +59,10 @@ source .venv/bin/activate  # Linux/Mac
 # Install all dependencies from requirements.txt
 uv pip install -r requirements.txt
 ```
-
+# 4. Running
+cd myprojects/spx-bot
+source .venv/bin/activate
+python main.py > /var/log/main.log 2>&1 &
+to check logs: nano Data/2025-06-17/spx.csv
 
 
