@@ -70,7 +70,7 @@ to check logs: nano Data/2025-06-17/spx.csv
 
 to kill: pkill -f main.py
 
-#5 Running Automated:
+# 4. Running Automated:
 Key: startup-script Value:
 #!/bin/bash
 cd /home/YOUR_USERNAME/myprojects/spx-bot
