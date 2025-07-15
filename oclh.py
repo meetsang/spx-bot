@@ -63,6 +63,7 @@ async def get_last_oclh_time(file_path):
             df = pd.read_csv(file_path)
             if not df.empty and 'Time_End' in df.columns:
                 last_time = pd.to_datetime(df['Time_End'].iloc[-1])
+                last_time = last_time.tz_localize(None)          # ensure naïve
                 return last_time
         except Exception as e:
             if VERBOSE:
@@ -279,6 +280,7 @@ async def calculate_write_oclh_and_indicators(interval_minutes, folder_path, spx
             # Parse time and calculate mid price
             try:
                 df['Time'] = pd.to_datetime(df['Time'])
+                df['Time'] = df['Time'].dt.tz_localize(None)     # make all values offset-naive
                 df['Mid_Price'] = calculate_mid_price(df['Bid Price'], df['Ask Price'])
                 df = df.sort_values('Time').reset_index(drop=True)
                 if VERBOSE:
@@ -320,6 +322,7 @@ async def calculate_write_oclh_and_indicators(interval_minutes, folder_path, spx
                 # For first run, process all available data
                 all_df = pd.read_csv(spx_file_with_path)
                 all_df['Time'] = pd.to_datetime(all_df['Time'])
+                all_df['Time'] = all_df['Time'].dt.tz_localize(None)  
                 all_df['Mid_Price'] = calculate_mid_price(all_df['Bid Price'], all_df['Ask Price'])
                 new_ohlc = create_ohlc_bars(all_df, interval_minutes, market_start_time, first_available_price)
                 first_run = False

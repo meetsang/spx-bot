@@ -19,9 +19,9 @@ jsonschema-specifications==2025.4.1
 korean-lunar-calendar==0.3.1
 MarkupSafe==3.0.2
 narwhals==1.41.1
-numpy @ file:///home/builder/.termux-build/python-numpy/src/dist/numpy-2.2.5-cp312-cp312-linux_aarch64.whl#sha256=bb263430c58123c72e01dae41691aa54d2d399cc779d2e77fbf8b41564156a4b
+numpy
 packaging==25.0
-pandas @ file:///home/builder/.termux-build/python-pandas/src/dist/pandas-2.3.0-cp312-cp312-linux_aarch64.whl#sha256=d350b7627d6a25560a4f7812a9d3deabfb67b9d3f31839939b5140d94786ada2
+pandas
 pandas_market_calendars==5.1.0
 protobuf==6.31.1
 pydantic==2.11.5
