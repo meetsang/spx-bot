@@ -11,6 +11,9 @@ This is a modular Python trading bot system designed for SPX index analysis and 
 
 All code is designed to run locally, even on a mobile device (e.g. Termux), and integrates easily with GitHub for syncing across devices.
 
+API used: https://tastyworks-api.readthedocs.io/en/latest/data-streamer.html
+https://github.com/tastyware/tastytrade
+
 ---
 
 ## 🔁 Git Workflow: Keeping Code in Sync
