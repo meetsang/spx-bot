@@ -3,13 +3,13 @@ import aiofiles
 from tastytrade import DXLinkStreamer, Session
 from tastytrade.dxfeed import Quote, Greeks
 from tastytrade.instruments import get_option_chain
+from tastytrade.dxfeed import Trade
 from datetime import date, datetime
 import logging
 import math
 import json
 import time
 import re
-#from datetime import datetime
 from pytz import timezone
 
 market_tz = timezone("US/Central")
@@ -85,11 +85,15 @@ async def initialize_csv_files(folder_path, regular_tickers, options):
     """Initialize CSV files with appropriate headers"""
     
     # Header for regular tickers
-    ticker_header = ['Time', 'Symbol', 'Bid Price', 'Ask Price', 'Bid Size', 'Ask Size']
+    ticker_header = [
+        'Time', 'Symbol', 'Bid Price', 'Ask Price', 'Bid Size', 'Ask Size',
+        'Mark Price', 'Last Size', 'Day Volume'
+    ]
     
     # Header for options (includes Greeks)
     option_header = [
         'Time', 'Symbol', 'Bid Price', 'Ask Price', 'Bid Size', 'Ask Size',
+        'Mark Price', 'Last Size', 'Day Volume',
         'Greeks Price', 'Volatility', 'Delta', 'Gamma', 'Theta', 'Rho', 'Vega'
     ]
     
@@ -156,6 +160,10 @@ async def stream_and_write(session, initial_tickers, folder_path, max_retries=5,
                 # Subscribe to quotes for all symbols
                 await streamer.subscribe(Quote, all_symbols)
                 print(f"Successfully subscribed to quotes for {len(all_symbols)} symbols")
+
+                # Subscribe to Trade for all symbols
+                await streamer.subscribe(Trade, all_symbols)
+                print(f"Successfully subscribed to trades for {len(all_symbols)} symbols")
                 
                 # Subscribe to Greeks for options only
                 greeks_available = False
@@ -175,6 +183,9 @@ async def stream_and_write(session, initial_tickers, folder_path, max_retries=5,
                 
                 # Storage for Greeks data - keyed by symbol
                 greeks_data = {}
+
+                # Storage for Trade (mark price) data - keyed by symbol
+                trade_data = {}
                 
                 while True:
                     try:
@@ -189,6 +200,17 @@ async def stream_and_write(session, initial_tickers, folder_path, max_retries=5,
                             last_data_time = time.time()
                             
                             current_time = datetime.now(market_tz).isoformat()
+
+                            # Get trade data for this symbol if available
+                            trade = trade_data.get(quote.event_symbol)
+                            mark_price = trade.price if trade else None
+                            last_size = trade.size if trade else None
+                            day_volume = trade.day_volume if trade else None
+                            
+                            # Debug print
+                            print(f"Processing quote for {quote.event_symbol}")
+                            print(f"Quote data: bid={quote.bid_price}, ask={quote.ask_price}, bid_size={quote.bid_size}, ask_size={quote.ask_size}")
+                            print(f"Trade data: mark_price={mark_price}, last_size={last_size}, day_volume={day_volume}")
                             
                             # Check if this is an option or regular ticker
                             if quote.event_symbol in option_symbols:
@@ -202,6 +224,9 @@ async def stream_and_write(session, initial_tickers, folder_path, max_retries=5,
                                     quote.ask_price,
                                     quote.bid_size,
                                     quote.ask_size,
+                                    mark_price,
+                                    last_size,
+                                    day_volume,
                                     greeks_info.get('price'),
                                     greeks_info.get('volatility'),
                                     greeks_info.get('delta'),
@@ -210,6 +235,7 @@ async def stream_and_write(session, initial_tickers, folder_path, max_retries=5,
                                     greeks_info.get('rho'),
                                     greeks_info.get('vega')
                                 ]
+                                print(f"Option row length: {len(row)}")
                             else:
                                 # This is a regular ticker
                                 row = [
@@ -218,54 +244,77 @@ async def stream_and_write(session, initial_tickers, folder_path, max_retries=5,
                                     quote.bid_price,
                                     quote.ask_price,
                                     quote.bid_size,
-                                    quote.ask_size
+                                    quote.ask_size,
+                                    mark_price,
+                                    last_size,
+                                    day_volume
                                 ]
+                                print(f"Regular ticker row length: {len(row)}")
+                                print(f"Row contents: {row}")
                             
                             # Write to appropriate file
                             file_path = symbol_to_filepath.get(quote.event_symbol)
                             if file_path:
+                                print(f"Cleaning row before writing...")
                                 cleaned_row = clean_row(row)
+                                print(f"Cleaned row length: {len(cleaned_row)}")
+                                print(f"Cleaned row: {cleaned_row}")
+                                
                                 # Only put quotes in data_queue (for backward compatibility)
                                 if quote.event_symbol not in option_symbols:
-                                    await data_queue.put(cleaned_row)
+                                    print(f"Adding to data_queue...")
+                                    # Temporarily comment out to isolate the issue
+                                    # await data_queue.put(cleaned_row)
+                                    pass
+                                
+                                print(f"Writing to CSV: {file_path}")
                                 await write_to_csv(file_path, cleaned_row)
+                                print(f"Successfully wrote row to CSV")
                             
                         except asyncio.TimeoutError:
-                            # Try to get Greeks events if available
-                            if greeks_available:
-                                try:
-                                    greeks = await asyncio.wait_for(
-                                        streamer.get_event(Greeks), 
-                                        timeout=1.0  # Shorter timeout for Greeks
-                                    )
-                                    
-                                    # Update Greeks data storage
-                                    if greeks.event_symbol in option_symbols:
-                                        greeks_data[greeks.event_symbol] = {
-                                            'price': greeks.price,
-                                            'volatility': greeks.volatility,
-                                            'delta': greeks.delta,
-                                            'gamma': greeks.gamma,
-                                            'theta': greeks.theta,
-                                            'rho': greeks.rho,
-                                            'vega': greeks.vega
-                                        }
-                                        
-                                        # Print periodic update
-                                        if int(time.time()) % 30 == 0:  # Every 30 seconds
-                                            print(f"Updated Greeks for {greeks.event_symbol}")
-                                    
-                                except asyncio.TimeoutError:
-                                    # Check if connection is really dead
-                                    if time.time() - last_data_time > connection_timeout:
-                                        print(f"No data received for {connection_timeout} seconds, assuming connection is dead")
-                                        break
-                            else:
-                                # No Greeks subscription, just check connection timeout
-                                if time.time() - last_data_time > connection_timeout:
-                                    print(f"No data received for {connection_timeout} seconds, assuming connection is dead")
-                                    break
+                            # Check if connection is really dead
+                            if time.time() - last_data_time > connection_timeout:
+                                print(f"No data received for {connection_timeout} seconds, assuming connection is dead")
+                                break
                     
+                        # Try to get Trade events
+                        try:
+                            trade = await asyncio.wait_for(
+                                streamer.get_event(Trade), 
+                                timeout=1.0
+                            )
+                            # Store trade data for use in quote processing
+                            trade_data[trade.event_symbol] = trade
+                        except asyncio.TimeoutError:
+                            pass  # Allow loop to continue
+
+                        # Try to get Greeks events if available
+                        if greeks_available:
+                            try:
+                                greeks = await asyncio.wait_for(
+                                    streamer.get_event(Greeks), 
+                                    timeout=1.0  # Shorter timeout for Greeks
+                                )
+                                
+                                # Update Greeks data storage
+                                if greeks.event_symbol in option_symbols:
+                                    greeks_data[greeks.event_symbol] = {
+                                        'price': greeks.price,
+                                        'volatility': greeks.volatility,
+                                        'delta': greeks.delta,
+                                        'gamma': greeks.gamma,
+                                        'theta': greeks.theta,
+                                        'rho': greeks.rho,
+                                        'vega': greeks.vega
+                                    }
+                                    
+                                    # Print periodic update
+                                    if int(time.time()) % 30 == 0:  # Every 30 seconds
+                                        print(f"Updated Greeks for {greeks.event_symbol}")
+                                
+                            except asyncio.TimeoutError:
+                                pass  # Allow loop to continue
+
                     except Exception as e:
                         print(f"Error during streaming: {e}")
                         print(f"Exception type: {type(e).__name__}")
