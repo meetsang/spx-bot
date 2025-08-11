@@ -7,6 +7,7 @@ from shared_queues import data_queue, subscription_queue
 from flask_app import app  # Import from renamed app.py (see next step)
 import os
 from datetime import datetime
+from SPX_9IF_0DTE_v2 import main as spx_9if_main
 
 def create_date_folder():
     today = datetime.now().strftime('%Y-%m-%d')
@@ -28,8 +29,10 @@ async def main():
     # Start async tasks for data streaming and OHLC
     await asyncio.gather(
         collect_data(folder_path),
-        oclh(folder_path)
+        oclh(folder_path),
+        spx_9if_main(strategy_name="SPX_9IF_0DTE", data_base_dir="Data")
     )
+
 
 if __name__ == "__main__":
     asyncio.run(main())
