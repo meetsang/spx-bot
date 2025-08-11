@@ -260,8 +260,8 @@ class Config:
     tif: OrderTimeInForce = OrderTimeInForce.DAY
 
     # Exit rules
-    per_if_stop: float = 500.0        # loss per IF to stop
-    portfolio_stop: float = 4000.0    # total loss to close all IFs
+    per_if_stop: float = 5.0        # loss per IF to stop
+    portfolio_stop: float = 40.0    # total loss to close all IFs
 
     # Streaming cadence
     max_quote_timeouts: int = 12
