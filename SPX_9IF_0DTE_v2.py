@@ -218,16 +218,40 @@ ATM derivation for first entry (when needed):
 2) Fallback to SPX Quote mid (bid+ask)/2.
 3) Round to nearest 5 for SPX’s strike grid.
 """
+#!/usr/bin/env python3
+"""
+SPX Iron Fly (IF) Strategy – 0 DTE Ladder with streaming quotes/greeks,
+per-IF and portfolio stops, and lateral roll logic.
+
+Enhancements:
+- Timezone awareness via tz_name (default America/Chicago) for entry gating/folder naming.
+- simulate_only mode: Full paper trade simulation with streaming, PnL, CSVs, and stop logic but *no* broker orders placed.
+- Minimal lateral roll on per-IF stop: Closes loser, opens new IF 1 step beyond far edge to keep ladder size constant.
+- SPX point-based stops: per-if_stop=4.0 ≈ $400, portfolio_stop=40.0 ≈ $4,000 (SPX multiplier = 100).
+- state.json includes full Config snapshot for run reproducibility.
+
+Original behaviour:
+- Entry: At scheduled HH:MM (tz_name), if no active IFs for today in state.json.
+- Ladder: 9 IFs centered ATM ± n steps, with call/put short at body, long wings width pts away.
+- Rolling: Replaces stopped far-edge IF with new far-edge IF one step beyond.
+- Exit: Portfolio stop closes everything. Per-IF stop triggers roll.
+- Restart-safe: state.json rehydrate active IFs on restart.
+
+Dependencies:
+- tastytrade API + DXFeed streaming support
+- zoneinfo for timezone
+"""
 
 import asyncio
 import csv
 import json
 import os
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, asdict, field
 from datetime import datetime, time
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Dict, List, Tuple, Optional
+from zoneinfo import ZoneInfo
 
 from tastytrade import Session, Account, DXLinkStreamer
 from tastytrade.dxfeed import Quote, Greeks, Trade
@@ -242,36 +266,38 @@ from tastytrade.order import NewOrder, OrderAction, OrderTimeInForce, OrderType
 class Config:
     secrets_file: str = "secrets.json"
 
-    # Entry schedule (local time)
+    # Timezone for entry/folder. Example: "America/Chicago"
+    tz_name: str = "America/Chicago"
+
+    # Entry schedule (tz-aware local time)
     entry_hour: int = 8
     entry_minute: int = 33
 
     # Ladder structure
-    n_above: int = 4         # number of IFs above ATM
-    n_below: int = 4         # number of IFs below ATM
-    step: int = 5            # distance between successive IF bodies
-    width: int = 60          # wings (distance from body)
+    n_above: int = 4         # count above ATM
+    n_below: int = 4         # count below ATM
+    step: int = 5            # step between bodies
+    width: int = 60          # wing width
 
     # Underlying
     symbol: str = "SPX"
 
     # Order params
     dry_run: bool = True
+    simulate_only: bool = True
     tif: OrderTimeInForce = OrderTimeInForce.DAY
 
-    # Exit rules
-    per_if_stop: float = 5.0        # loss per IF to stop
-    portfolio_stop: float = 40.0    # total loss to close all IFs
+    # Stops in SPX points
+    per_if_stop: float = 4.0       # ~ $400
+    portfolio_stop: float = 40.0   # ~ $4,000
 
-    # Streaming cadence
+    # Streaming
     max_quote_timeouts: int = 12
     quote_wait_timeout: float = 2.5
 
-    # Data folder base
+    # File paths
     data_base_dir: str = "Data"
     strategy_name: str = "SPX_9IF_0DTE"
-
-    # Filenames within the strategy folder
     quotes_csv: str = "quotes.csv"
     pnl_if_csv: str = "pnl.csv"
     pnl_strategy_csv: str = "pnl_strategy.csv"
@@ -281,32 +307,34 @@ class Config:
 # =========================
 # Helpers
 # =========================
-def round_to_nickel(value: float) -> float:
-    d = Decimal(str(value))
+def now_in_tz(tz_name: str) -> datetime:
+    """Return current datetime in desired timezone."""
+    return datetime.now(ZoneInfo(tz_name))
+
+def fmt2(val: float) -> str:
+    """Format float to 2 decimals."""
+    return f"{val:.2f}"
+
+def round_to_nickel(val: float) -> float:
+    """Round to nearest $0.05."""
+    d = Decimal(str(val))
     nickel = Decimal("0.05")
     return float((d / nickel).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * nickel)
 
-def fmt2(value: float) -> str:
-    return f"{value:.2f}"
-
-def now_local() -> datetime:
-    return datetime.now()
-
-def is_time_to_enter(cfg: Config) -> bool:
-    target = time(hour=cfg.entry_hour, minute=cfg.entry_minute)
-    return now_local().time() >= target
-
 def nearest(items: List[float], target: float) -> float:
+    """Find element in list closest to target."""
     return min(items, key=lambda x: abs(x - target))
 
 def ensure_strategy_folder(cfg: Config) -> str:
-    date_str = now_local().strftime("%Y-%m-%d")
+    """Ensure Data/<YYYY-MM-DD>/<Strategy> exists."""
+    date_str = now_in_tz(cfg.tz_name).strftime("%Y-%m-%d")
     folder = os.path.join(cfg.data_base_dir, date_str, cfg.strategy_name)
     os.makedirs(folder, exist_ok=True)
     return folder
 
-def write_csv_row(filepath: str, fieldnames: List[str], row: Dict, write_header_if_missing: bool = True):
-    write_header = write_header_if_missing and (not os.path.exists(filepath) or os.path.getsize(filepath) == 0)
+def write_csv_row(filepath: str, fieldnames: List[str], row: Dict):
+    """Append a CSV row, write header if missing."""
+    write_header = not os.path.exists(filepath) or os.path.getsize(filepath) == 0
     with open(filepath, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         if write_header:
@@ -330,6 +358,7 @@ class IronFly:
     open: bool = True
 
     def streamer_symbols(self) -> List[str]:
+        """Streamer symbols for all 4 legs."""
         return [
             self.call_short_opt.streamer_symbol,
             self.call_long_opt.streamer_symbol,
@@ -337,29 +366,38 @@ class IronFly:
             self.put_long_opt.streamer_symbol,
         ]
 
-
 @dataclass
 class StrategyState:
-    # entered_today is true if we have already opened positions for today
     entered_today: bool = False
-    # expiry (YYYY-MM-DD) for the current positions (0DTE)
     expiry: Optional[str] = None
-    active_flies: Dict[float, IronFly] = field(default_factory=dict)  # keyed by body
+    active_flies: Dict[float, IronFly] = field(default_factory=dict)
     closed_flies: Dict[float, IronFly] = field(default_factory=dict)
     per_if_pnl: Dict[float, float] = field(default_factory=dict)
     total_pnl: float = 0.0
-
-
 # =========================
-# Strategy class
+# Strategy class (Part 2/3)
 # =========================
 class SPXIFStrategy:
+    """
+    Implements the full SPX 0DTE Iron Fly ladder strategy with:
+    - Timezone-aware entry gating and folder structure.
+    - Streaming quotes/greeks for pricing and PnL.
+    - Per-IF and portfolio stops.
+    - Minimal lateral roll within the same expiry to maintain ladder size.
+    - Simulation mode to avoid broker orders while keeping full telemetry.
+    - Restart-safe state rehydration via state.json.
+    """
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
+
+        # Session & account
         with open(cfg.secrets_file, "r") as f:
             sec = json.load(f)
         self.session = Session(sec["username"], sec["password"])
         self.account = Account.get(self.session, sec["AccountNumber"])
+
+        # Strategy state
         self.state = StrategyState()
 
         # Folders and paths
@@ -390,12 +428,15 @@ class SPXIFStrategy:
             fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
             fh.setFormatter(fmt)
             self.logger.addHandler(fh)
+
+            # Console output as well
             ch = logging.StreamHandler()
             ch.setLevel(logging.INFO)
             ch.setFormatter(fmt)
             self.logger.addHandler(ch)
 
     def update_file_handler(self):
+        """Re-point file handler to a new date folder after rollover."""
         new_path = os.path.join(self.strategy_folder, "strategy.log")
         for h in list(self.logger.handlers):
             if isinstance(h, logging.FileHandler):
@@ -413,9 +454,13 @@ class SPXIFStrategy:
 
     # ---------- State persistence ----------
     def save_state(self):
+        """Persist current strategy state and config snapshot to state.json."""
         try:
+            cfg_snapshot = asdict(self.cfg)
+            # Convert enum to JSON-friendly
+            cfg_snapshot["tif"] = self.cfg.tif.value if hasattr(self.cfg.tif, "value") else str(self.cfg.tif)
             payload = {
-                "timestamp": now_local().isoformat(),
+                "timestamp": now_in_tz(self.cfg.tz_name).isoformat(),
                 "expiry": self.state.expiry,
                 "entered_today": self.state.entered_today,
                 "active_flies": [
@@ -429,6 +474,7 @@ class SPXIFStrategy:
                 ],
                 "closed_flies": sorted(list(self.state.closed_flies.keys())),
                 "total_pnl": float(Decimal(self.state.total_pnl).quantize(Decimal("0.01"))),
+                "config": cfg_snapshot,
             }
             with open(self.state_path, "w") as f:
                 json.dump(payload, f, indent=2)
@@ -436,12 +482,16 @@ class SPXIFStrategy:
             self.logger.error(f"Failed to save state: {e}", exc_info=True)
 
     def load_state(self) -> Optional[dict]:
+        """
+        Load state from disk; if missing, auto-create a default empty state for today.
+        Returns loaded dict or None on unexpected error.
+        """
         try:
             with open(self.state_path, "r") as f:
                 return json.load(f)
         except FileNotFoundError:
             # Auto-create a default state for today on first run
-            today_str = now_local().strftime("%Y-%m-%d")
+            today_str = now_in_tz(self.cfg.tz_name).strftime("%Y-%m-%d")
             self.state.expiry = today_str
             self.state.entered_today = False
             self.state.active_flies.clear()
@@ -449,28 +499,38 @@ class SPXIFStrategy:
             self.state.total_pnl = 0.0
             self.save_state()
             self.logger.info("state.json not found; created a fresh default state.")
-            return {
-                "timestamp": now_local().isoformat(),
-                "expiry": today_str,
-                "entered_today": False,
-                "active_flies": [],
-                "closed_flies": [],
-                "total_pnl": 0.0
-            }
+            try:
+                with open(self.state_path, "r") as f:
+                    return json.load(f)
+            except Exception as e:
+                self.logger.error(f"Failed to read newly created state.json: {e}", exc_info=True)
+                return None
         except Exception as e:
             self.logger.error(f"Failed to load state.json: {e}", exc_info=True)
             return None
 
     # ---------- Entry/Exit/Status ----------
     def evaluate_entry_window(self) -> bool:
-        ready = is_time_to_enter(self.cfg) and not self.state.entered_today
+        """
+        Return True if current tz-aware time has reached configured entry and we haven't entered today.
+        """
+        now = now_in_tz(self.cfg.tz_name)
+        target = time(hour=self.cfg.entry_hour, minute=self.cfg.entry_minute)
+        ready = (now.time() >= target) and not self.state.entered_today
         if ready:
-            self.logger.info("Entry window met and not entered yet.")
+            self.logger.info(f"Entry window met at {now.isoformat()} ({self.cfg.tz_name}), not entered yet.")
         return ready
 
     def evaluate_exit_rules(self) -> Tuple[List[float], bool]:
+        """
+        Evaluate per-IF and portfolio exit conditions.
+
+        Returns:
+          - list of IF bodies to close/roll due to per-IF stop (SPX points)
+          - True if portfolio stop is hit (close everything)
+        """
         to_close = []
-        portfolio_loss = -self.state.total_pnl
+        portfolio_loss = -self.state.total_pnl  # total_pnl > 0 is profit; loss is negative
         portfolio_stop_hit = portfolio_loss >= self.cfg.portfolio_stop
         if portfolio_stop_hit:
             self.logger.info(f"Portfolio stop hit: loss={fmt2(portfolio_loss)} >= {fmt2(self.cfg.portfolio_stop)}")
@@ -478,12 +538,16 @@ class SPXIFStrategy:
 
         for body, pnl in self.state.per_if_pnl.items():
             if -pnl >= self.cfg.per_if_stop:
-                self.logger.info(f"Per-IF stop hit at body {fmt2(body)}: pnl={fmt2(pnl)}")
+                self.logger.info(f"Per-IF stop hit at body {fmt2(body)}: pnl={fmt2(pnl)} (<= -{fmt2(self.cfg.per_if_stop)})")
                 to_close.append(body)
 
         return to_close, False
 
     def compute_strategy_status(self, fly_mids: Dict[float, float]) -> None:
+        """
+        Compute per-IF and total PnL using current mid credits (SPX points):
+        PnL ≈ entry_credit − current_mid (debit to close).
+        """
         per_if_pnl = {}
         total = 0.0
         for body, fly in self.state.active_flies.items():
@@ -502,13 +566,17 @@ class SPXIFStrategy:
 
     # ---------- Chain & expiry ----------
     def get_chain(self):
+        """Fetch full option chain for symbol."""
         self.logger.info("Fetching option chain...")
         chain = get_option_chain(self.session, self.cfg.symbol)
         self.logger.info("Option chain fetched.")
         return chain
 
     def pick_0dte(self, chain) -> Optional[datetime.date]:
-        today = now_local().date()
+        """
+        Return today's expiration date if present; strategy requires 0DTE only.
+        """
+        today = now_in_tz(self.cfg.tz_name).date()
         exps = sorted(chain.keys())
         same_day = [d for d in exps if d == today]
         if same_day:
@@ -519,27 +587,39 @@ class SPXIFStrategy:
         return None
 
     async def get_underlying_spot_mark_rounded5(self) -> Optional[float]:
+        """
+        Determine ATM body:
+        - Prefer Trade.price (Mark) via DXFeed Trade.
+        - Fallback to Quote mid (bid+ask)/2 via DXFeed Quote.
+        - Round to nearest 5 to align with SPX strikes.
+        """
         try:
             async with DXLinkStreamer(self.session) as s:
                 await s.subscribe(Quote, [self.cfg.symbol])
                 await s.subscribe(Trade, [self.cfg.symbol])
+
                 mark = None
                 mid = None
                 for _ in range(6):
+                    # Try Trade (mark)
                     try:
                         t = await asyncio.wait_for(s.get_event(Trade), timeout=0.5)
                         if t.event_symbol == self.cfg.symbol and t.price is not None:
                             mark = float(t.price)
                     except asyncio.TimeoutError:
                         pass
+
+                    # Try Quote (mid)
                     try:
                         q = await asyncio.wait_for(s.get_event(Quote), timeout=0.5)
                         if q.event_symbol == self.cfg.symbol and q.bid_price and q.ask_price:
                             mid = float((q.bid_price + q.ask_price) / 2)
                     except asyncio.TimeoutError:
                         pass
+
                     if mark is not None:
                         break
+
                 spot = mark if mark is not None else mid
                 if spot is None:
                     self.logger.warning("Could not determine SPX mark or mid for ATM.")
@@ -552,15 +632,23 @@ class SPXIFStrategy:
             return None
 
     def build_if_options(self, options, body: float, width: int):
+        """
+        Map a body strike to its 4 legs using Option objects from the chain.
+        """
         calls = [o for o in options if o.option_type == "C"]
-        puts  = [o for o in options if o.option_type == "P"]
+        puts = [o for o in options if o.option_type == "P"]
         call_body = next(c for c in calls if float(c.strike_price) == body)
         put_body  = next(p for p in puts  if float(p.strike_price) == body)
         call_wing = next(c for c in calls if float(c.strike_price) == body + width)
         put_wing  = next(p for p in puts  if float(p.strike_price) == body - width)
         return call_body, call_wing, put_body, put_wing
 
+    # ---------- Streaming ----------
     async def mids_for_symbols(self, syms: List[str]) -> Dict[str, Dict[str, float]]:
+        """
+        Stream quotes (and attempt greeks) and compute mid prices.
+        Returns: {symbol: {'bid','ask','mid','delta','gamma','theta','vega', flags...}}
+        """
         out: Dict[str, Dict[str, float]] = {
             s: {'bid': None, 'ask': None, 'mid': None,
                 'delta': None, 'gamma': None, 'theta': None, 'vega': None,
@@ -583,6 +671,7 @@ class SPXIFStrategy:
                 timeouts = 0
                 while (quotes_collected < target_quotes or greeks_collected < target_greeks) and timeouts < self.cfg.max_quote_timeouts:
                     got_event = False
+                    # Quote
                     try:
                         q = await asyncio.wait_for(s.get_event(Quote), timeout=self.cfg.quote_wait_timeout)
                         if q.event_symbol in out and not out[q.event_symbol]['has_quote']:
@@ -598,6 +687,7 @@ class SPXIFStrategy:
                     except asyncio.TimeoutError:
                         pass
 
+                    # Greeks
                     if greeks_available:
                         try:
                             g = await asyncio.wait_for(s.get_event(Greeks), timeout=0.05)
@@ -621,6 +711,9 @@ class SPXIFStrategy:
         return out
 
     async def if_mid_credit(self, fly: IronFly) -> Optional[float]:
+        """
+        Compute the current mid 'credit' of the fly as (shorts) − (longs).
+        """
         syms = fly.streamer_symbols()
         data = await self.mids_for_symbols(syms)
         try:
@@ -636,24 +729,33 @@ class SPXIFStrategy:
             self.logger.error(f"Error computing IF mid credit for body {fmt2(fly.body)}: {e}", exc_info=True)
             return None
 
-    # ---------- Orders ----------
-    def _build_leg_from_option(self, opt_obj, qty: int, action: OrderAction):
-        return opt_obj.build_leg(Decimal(str(qty)), action)
-
+    # ---------- Orders (simulate_only-aware) ----------
     async def open_if(self, fly: IronFly, dry_run: Optional[bool] = None) -> bool:
-        dry = self.cfg.dry_run if dry_run is None else dry_run
+        """
+        Open an iron fly:
+        - If simulate_only=True, simulate fill at current mid credit and update state/logs.
+        - Else, place a broker order (dry_run/live per config), then update state/logs.
+        """
         credit = await self.if_mid_credit(fly)
         if credit is None:
             self.logger.warning(f"Could not price IF {fmt2(fly.body)} (missing mids)")
             return False
 
-        legs = [
-            self._build_leg_from_option(fly.call_short_opt, fly.qty, OrderAction.SELL_TO_OPEN),
-            self._build_leg_from_option(fly.call_long_opt,  fly.qty, OrderAction.BUY_TO_OPEN),
-            self._build_leg_from_option(fly.put_short_opt,  fly.qty, OrderAction.SELL_TO_OPEN),
-            self._build_leg_from_option(fly.put_long_opt,   fly.qty, OrderAction.BUY_TO_OPEN),
-        ]
+        # Simulation path: do not place broker order
+        if self.cfg.simulate_only:
+            fly.entry_credit = credit
+            fly.open = True
+            self.state.active_flies[fly.body] = fly
+            self.logger.info(f"[SIM] Opened IF {fmt2(fly.body)} for credit ${fmt2(credit)}")
+            return True
 
+        # Live/dry-run order path
+        legs = [
+            fly.call_short_opt.build_leg(Decimal(str(fly.qty)), OrderAction.SELL_TO_OPEN),
+            fly.call_long_opt.build_leg(Decimal(str(fly.qty)), OrderAction.BUY_TO_OPEN),
+            fly.put_short_opt.build_leg(Decimal(str(fly.qty)), OrderAction.SELL_TO_OPEN),
+            fly.put_long_opt.build_leg(Decimal(str(fly.qty)), OrderAction.BUY_TO_OPEN),
+        ]
         order = NewOrder(
             time_in_force=self.cfg.tif,
             order_type=OrderType.LIMIT,
@@ -661,40 +763,41 @@ class SPXIFStrategy:
             price=Decimal(str(credit))
         )
         try:
-            self.account.place_order(self.session, order, dry_run=dry)
+            self.account.place_order(self.session, order, dry_run=(self.cfg.dry_run if dry_run is None else dry_run))
             fly.entry_credit = credit
             fly.open = True
-            self.logger.info(f"Opened IF {fmt2(fly.body)} for credit ${fmt2(credit)} dry={dry}")
+            self.state.active_flies[fly.body] = fly
+            self.logger.info(f"Opened IF {fmt2(fly.body)} for credit ${fmt2(credit)} dry={self.cfg.dry_run if dry_run is None else dry_run}")
             return True
         except Exception as e:
             self.logger.error(f"Open IF {fmt2(fly.body)} failed: {e}", exc_info=True)
             return False
 
     async def close_if(self, fly: IronFly, dry_run: Optional[bool] = None) -> bool:
-        dry = self.cfg.dry_run if dry_run is None else dry_run
-        syms = fly.streamer_symbols()
-        data = await self.mids_for_symbols(syms)
-        try:
-            cs = data[fly.call_short_opt.streamer_symbol]["mid"]
-            cl = data[fly.call_long_opt.streamer_symbol]["mid"]
-            ps = data[fly.put_short_opt.streamer_symbol]["mid"]
-            pl = data[fly.put_long_opt.streamer_symbol]["mid"]
-            if None in (cs, cl, ps, pl):
-                self.logger.warning(f"Could not price close for IF {fmt2(fly.body)} (missing mids)")
-                return False
-            debit = (cs + ps) - (cl + pl)
-            debit = float(round_to_nickel(debit))
-        except Exception as e:
-            self.logger.error(f"Could not price close for IF {fmt2(fly.body)}: {e}", exc_info=True)
+        """
+        Close an iron fly:
+        - If simulate_only=True, simulate fill at current mid debit and update state/logs.
+        - Else, place a broker order (dry_run/live per config), then update state/logs.
+        """
+        debit = await self.if_mid_credit(fly)
+        if debit is None:
+            self.logger.warning(f"Could not price close for IF {fmt2(fly.body)} (missing mids)")
             return False
 
-        legs = [
-            self._build_leg_from_option(fly.call_short_opt, fly.qty, OrderAction.BUY_TO_CLOSE),
-            self._build_leg_from_option(fly.call_long_opt,  fly.qty, OrderAction.SELL_TO_CLOSE),
-            self._build_leg_from_option(fly.put_short_opt,  fly.qty, OrderAction.BUY_TO_CLOSE),
-            self._build_leg_from_option(fly.put_long_opt,   fly.qty, OrderAction.SELL_TO_CLOSE),
-        ]
+        # Simulation path
+        if self.cfg.simulate_only:
+            fly.open = False
+            self.state.closed_flies[fly.body] = fly
+            self.logger.info(f"[SIM] Closed IF {fmt2(fly.body)} for debit ${fmt2(debit)}")
+            return True
 
+        # Live/dry-run order path
+        legs = [
+            fly.call_short_opt.build_leg(Decimal(str(fly.qty)), OrderAction.BUY_TO_CLOSE),
+            fly.call_long_opt.build_leg(Decimal(str(fly.qty)), OrderAction.SELL_TO_CLOSE),
+            fly.put_short_opt.build_leg(Decimal(str(fly.qty)), OrderAction.BUY_TO_CLOSE),
+            fly.put_long_opt.build_leg(Decimal(str(fly.qty)), OrderAction.SELL_TO_CLOSE),
+        ]
         order = NewOrder(
             time_in_force=self.cfg.tif,
             order_type=OrderType.LIMIT,
@@ -702,9 +805,10 @@ class SPXIFStrategy:
             price=Decimal(str(debit))
         )
         try:
-            self.account.place_order(self.session, order, dry_run=dry)
+            self.account.place_order(self.session, order, dry_run=(self.cfg.dry_run if dry_run is None else dry_run))
             fly.open = False
-            self.logger.info(f"Closed IF {fmt2(fly.body)} for debit ${fmt2(debit)} dry={dry}")
+            self.state.closed_flies[fly.body] = fly
+            self.logger.info(f"Closed IF {fmt2(fly.body)} for debit ${fmt2(debit)} dry={self.cfg.dry_run if dry_run is None else dry_run}")
             return True
         except Exception as e:
             self.logger.error(f"Close IF {fmt2(fly.body)} failed: {e}", exc_info=True)
@@ -712,40 +816,44 @@ class SPXIFStrategy:
 
     # ---------- CSV writers ----------
     def write_quotes_csv(self, rows: List[Dict]):
+        """
+        Append quote/greeks rows to quotes.csv with 2-decimal formatting for all numeric fields.
+        """
         if not rows:
             return
         fieldnames = ["ts", "symbol", "bid", "ask", "mid", "delta", "gamma", "theta", "vega"]
+        # ensure 2-decimal formatting for numeric fields
         for r in rows:
             for k in ["bid", "ask", "mid", "delta", "gamma", "theta", "vega"]:
                 if r.get(k) is not None:
-                    r[k] = fmt2(float(r[k]))
-        # write header by writing first row once (ensures header)
-        write_csv_row(self.quotes_path, fieldnames, rows[0])
+                    try:
+                        r[k] = fmt2(float(r[k]))
+                    except Exception:
+                        pass
+        write_csv_row(self.quotes_path, fieldnames, rows[0])  # ensures header
         with open(self.quotes_path, "a", newline="") as f:
             w = csv.DictWriter(f, fieldnames=fieldnames)
             for r in rows:
                 w.writerow(r)
 
     def write_pnl_if_csv(self):
-        fieldnames = ["ts", "body", "pnl", "total_pnl"]
-        ts = now_local().isoformat()
-        self.write_pnl_strategy_row(ts, self.state.total_pnl)
+        """
+        Write per-IF PnL rows to pnl.csv and total PnL to pnl_strategy.csv.
+        """
+        ts = now_in_tz(self.cfg.tz_name).isoformat()
+        # Total strategy PnL
+        write_csv_row(self.pnl_strategy_path, ["ts", "strategy_total_pnl"],
+                      {"ts": ts, "strategy_total_pnl": fmt2(self.state.total_pnl)})
+        # Per-IF PnL
         for body, pnl in sorted(self.state.per_if_pnl.items()):
-            row = {
-                "ts": ts,
-                "body": fmt2(body),
-                "pnl": fmt2(pnl),
-                "total_pnl": fmt2(self.state.total_pnl),
-            }
-            write_csv_row(self.pnl_if_path, fieldnames, row)
-
-    def write_pnl_strategy_row(self, ts: str, total_pnl: float):
-        fieldnames = ["ts", "strategy_total_pnl"]
-        row = {"ts": ts, "strategy_total_pnl": fmt2(total_pnl)}
-        write_csv_row(self.pnl_strategy_path, fieldnames, row)
+            write_csv_row(self.pnl_if_path, ["ts", "body", "pnl", "total_pnl"],
+                          {"ts": ts, "body": fmt2(body), "pnl": fmt2(pnl), "total_pnl": fmt2(self.state.total_pnl)})
 
     # ---------- Streaming and mark-to-market ----------
     async def stream_and_mark(self):
+        """
+        Stream quotes/greeks for all open legs, write quotes.csv, recompute PnL, write pnl.csv, and save state.
+        """
         if not self.state.active_flies:
             return
         syms = sorted(set(
@@ -754,8 +862,9 @@ class SPXIFStrategy:
         ))
         data = await self.mids_for_symbols(syms)
 
+        # quotes.csv rows
         rows = []
-        ts = now_local().isoformat()
+        ts = now_in_tz(self.cfg.tz_name).isoformat()
         for s, d in data.items():
             rows.append({
                 "ts": ts,
@@ -770,6 +879,7 @@ class SPXIFStrategy:
             })
         self.write_quotes_csv(rows)
 
+        # Compute fly current mids (debit to close approximation)
         fly_mids: Dict[float, float] = {}
         for body, fly in self.state.active_flies.items():
             try:
@@ -784,13 +894,16 @@ class SPXIFStrategy:
             except Exception:
                 continue
 
+        # Update internal status and write PnL CSVs
         self.compute_strategy_status(fly_mids)
         self.write_pnl_if_csv()
-        # Persist state periodically
         self.save_state()
-
     # ---------- Ladder construction ----------
     def construct_ladder(self, options, atm_body: float) -> List[IronFly]:
+        """
+        Build a ladder of iron flies centered at atm_body,
+        with n_below and n_above bodies spaced by step.
+        """
         bodies = [atm_body]
         for i in range(1, self.cfg.n_below + 1):
             bodies.append(atm_body - i * self.cfg.step)
@@ -809,38 +922,69 @@ class SPXIFStrategy:
         self.logger.info(f"Constructed ladder bodies: {', '.join(fmt2(x) for x in bodies)}")
         return flies
 
+    # ---------- Roll logic ----------
+    async def roll_replacement(self, options, hit_body: float):
+        """
+        Close the losing far-side IF and open a new one on the opposite end by one more step.
+        Keeps total IF count constant.
+        """
+        if not self.state.active_flies:
+            return
+
+        active_bodies = sorted(self.state.active_flies.keys())
+        lowest, highest = active_bodies[0], active_bodies[-1]
+
+        if hit_body == lowest:
+            new_body = highest + self.cfg.step
+        elif hit_body == highest:
+            new_body = lowest - self.cfg.step
+        else:
+            # Default to direction away from loser toward far edge
+            if abs(hit_body - lowest) < abs(hit_body - highest):
+                new_body = highest + self.cfg.step
+            else:
+                new_body = lowest - self.cfg.step
+
+        cs_opt, cl_opt, ps_opt, pl_opt = self.build_if_options(options, new_body, self.cfg.width)
+        new_fly = IronFly(
+            body=new_body, width=self.cfg.width, qty=1,
+            call_short_opt=cs_opt, call_long_opt=cl_opt,
+            put_short_opt=ps_opt,  put_long_opt=pl_opt
+        )
+        ok = await self.open_if(new_fly)
+        if ok:
+            self.state.active_flies[new_body] = new_fly
+            self.logger.info(f"[ROLL] Added new IF at {fmt2(new_body)} replacing stopped {fmt2(hit_body)}")
+
     # ---------- State rehydration ----------
     def rehydrate_from_state(self, chain):
         """
-        Restore active IFs from state.json; state.json is auto-created if missing.
-        Only 0DTE is used; expiry must match today. If mismatch, treat as no active IFs.
+        Restore active IFs from state.json; auto-creates if missing.
+        Only 0DTE is used; expiry must match today; else treat as empty.
         """
         data = self.load_state()
         if not data:
             return
 
-        today_str = now_local().strftime("%Y-%m-%d")
+        today_str = now_in_tz(self.cfg.tz_name).strftime("%Y-%m-%d")
         expiry_str = data.get("expiry")
         active = data.get("active_flies", [])
         entered_today = bool(active) and expiry_str == today_str
 
         if not entered_today:
-            # No active flies for today
             self.state.entered_today = False
-            self.state.expiry = today_str  # will be set properly after pick_0dte
-            self.logger.info("No active IFs rehydrated for today (either empty or expiry mismatch).")
+            self.state.expiry = today_str
+            self.logger.info("No active IFs rehydrated for today (empty or expiry mismatch).")
             self.save_state()
             return
 
-        # Expiry matches today: rebuild flies
         try:
             expiry_date = datetime.strptime(expiry_str, "%Y-%m-%d").date()
         except Exception:
             self.logger.error("Invalid expiry format in state.json; expected YYYY-MM-DD.")
             return
-
         if expiry_date not in chain:
-            self.logger.error("Expiry from state.json not present in chain; cannot rehydrate.")
+            self.logger.error("Expiry from state.json not present in option chain; cannot rehydrate.")
             return
 
         options = chain[expiry_date]
@@ -870,7 +1014,7 @@ class SPXIFStrategy:
 
     # ---------- Strategy loop ----------
     async def run(self):
-        # Ensure today's strategy folder (handles date rollovers)
+        # Ensure today's folder and update paths
         self.strategy_folder = ensure_strategy_folder(self.cfg)
         self.quotes_path = os.path.join(self.strategy_folder, self.cfg.quotes_csv)
         self.pnl_if_path = os.path.join(self.strategy_folder, self.cfg.pnl_if_csv)
@@ -878,7 +1022,7 @@ class SPXIFStrategy:
         self.state_path = os.path.join(self.strategy_folder, self.cfg.state_json)
         self.update_file_handler()
 
-        # Load chain and pick 0DTE only
+        # Get chain and select 0DTE
         chain = self.get_chain()
         expiry = self.pick_0dte(chain)
         if expiry is None:
@@ -887,11 +1031,11 @@ class SPXIFStrategy:
         options = chain[expiry]
         self.state.expiry = expiry.strftime("%Y-%m-%d")
 
-        # Rehydrate state (auto-creates default if missing)
+        # Restore active IFs if any
         self.rehydrate_from_state(chain)
 
         while True:
-            # Refresh folder daily
+            # Date rollover: update paths, handlers
             current_folder = ensure_strategy_folder(self.cfg)
             if current_folder != self.strategy_folder:
                 self.strategy_folder = current_folder
@@ -902,12 +1046,10 @@ class SPXIFStrategy:
                 self.update_file_handler()
                 self.logger.info("Date rollover handled: paths and logger updated.")
 
-            # Entry: only if no active IFs for today and entry window is met
+            # Entry check
             if self.evaluate_entry_window() and not self.state.active_flies:
-                # Determine ATM body for first entry
                 atm_body = await self.get_underlying_spot_mark_rounded5()
                 if atm_body is None:
-                    # If we can't derive spot at all, fallback to chain median nearest
                     strikes = sorted(list({float(o.strike_price) for o in options}))
                     approx = strikes[len(strikes)//2]
                     atm_body = nearest(strikes, approx)
@@ -916,24 +1058,22 @@ class SPXIFStrategy:
                 ladder = self.construct_ladder(options, atm_body)
                 opened = 0
                 for fly in ladder:
-                    ok = await self.open_if(fly, dry_run=self.cfg.dry_run)
-                    if ok:
+                    if await self.open_if(fly):
                         self.state.active_flies[fly.body] = fly
                         opened += 1
                 self.state.entered_today = opened > 0
                 self.save_state()
                 self.logger.info(f"Opened {opened} IFs at 0DTE {expiry}")
 
-            # Stream quotes/greeks and mark-to-market
+            # Stream + mark-to-market
             await self.stream_and_mark()
 
-            # Exit checks
+            # Evaluate exits
             to_close, portfolio_stop = self.evaluate_exit_rules()
             if portfolio_stop and self.state.active_flies:
-                self.logger.info("Portfolio stop hit; closing all IFs (no roll).")
+                self.logger.info("Portfolio stop hit; closing all IFs.")
                 for fly in list(self.state.active_flies.values()):
-                    ok = await self.close_if(fly, dry_run=self.cfg.dry_run)
-                    if ok:
+                    if await self.close_if(fly):
                         self.state.closed_flies[fly.body] = fly
                         self.state.active_flies.pop(fly.body, None)
                 self.save_state()
@@ -942,10 +1082,11 @@ class SPXIFStrategy:
                     fly = self.state.active_flies.get(body)
                     if not fly or not fly.open:
                         continue
-                    ok = await self.close_if(fly, dry_run=self.cfg.dry_run)
-                    if ok:
+                    if await self.close_if(fly):
                         self.state.closed_flies[body] = fly
                         self.state.active_flies.pop(body, None)
+                        # Perform roll
+                        await self.roll_replacement(options, body)
                 self.save_state()
 
             await asyncio.sleep(2.0)
@@ -957,22 +1098,19 @@ class SPXIFStrategy:
 async def main(
     strategy_name: Optional[str] = None,
     data_base_dir: Optional[str] = None,
-    dry_run: Optional[bool] = None
+    dry_run: Optional[bool] = None,
+    simulate_only: Optional[bool] = None,
+    tz_name: Optional[str] = None
 ):
     """
-    Import and await from your orchestrator:
+    Import and run from orchestrator, e.g.:
 
-        from SPX_9IF_0DTE_v2 import main as spx_9if_main
+        from SPX_9IF_0DTE_v2 import main as spx_if_main
         await asyncio.gather(
-            collect_data(folder_path),
-            oclh(folder_path),
-            spx_9if_main(strategy_name="SPX_9IF_0DTE", data_base_dir="Data", dry_run=True)
+            data_collection_task(),
+            spx_if_main(strategy_name="SPX_9IF_0DTE", data_base_dir="Data",
+                        dry_run=False, simulate_only=True, tz_name="America/Chicago")
         )
-
-    Notes:
-    - Auto-creates state.json if missing on first run.
-    - Uses only 0DTE expiry.
-    - No rolling; closes on per-IF or portfolio stop.
     """
     cfg = Config()
     if strategy_name:
@@ -981,12 +1119,15 @@ async def main(
         cfg.data_base_dir = data_base_dir
     if dry_run is not None:
         cfg.dry_run = dry_run
+    if simulate_only is not None:
+        cfg.simulate_only = simulate_only
+    if tz_name:
+        cfg.tz_name = tz_name
 
     strat = SPXIFStrategy(cfg)
     await strat.run()
 
 
-# Standalone execution
 if __name__ == "__main__":
     try:
         asyncio.run(main())
