@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block content %}
+  <h4>Strategy Dashboard</h4>
+
+  <form class="date-form" method="get">
+    <div class="row g-2 align-items-end">
+      <div class="col-auto">
+        <label for="date" class="form-label">Select Date</label>
+        <select class="form-select" id="date" name="date">
+          {% for d in dates %}
+            <option value="{{ d }}" {% if d == selected_date %}selected{% endif %}>{{ d }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-auto">
+        <button type="submit" class="btn btn-primary">Load</button>
+      </div>
+    </div>
+  </form>
+
+  {% if spx_available %}
+    <div id="chart" style="height: 560px;"></div>
+    <script>
+      const chartData = {{ plotly_data | safe }};
+      const layout = {{ plotly_layout | safe }};
+      layout.hovermode = 'x unified';
+      Plotly.newPlot('chart', chartData, layout, {responsive: true});
+    </script>
+  {% else %}
+    <div class="alert alert-warning">No SPX data found for {{ selected_date }}.</div>
+  {% endif %}
+
+  {% if strategy_found %}
+    <hr>
+    <h5>state.json</h5>
+    {% if status_text %}
+      <pre>{{ status_text }}</pre>
+    {% else %}
+      <div class="alert alert-info">No status.csv found for {{ selected_date }}.</div>
+    {% endif %}
+
+    <h5 class="mt-3">pnl.csv</h5>
+    {% if pnl_if_text %}
+      <pre>{{ pnl_if_text }}</pre>
+    {% else %}
+      <div class="alert alert-info">No pnl.csv found for {{ selected_date }}.</div>
+    {% endif %}
+  {% endif %}
+{% endblock %}

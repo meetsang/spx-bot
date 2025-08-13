@@ -1,0 +1,147 @@
+{% extends "base.html" %}
+{% block content %}
+  <h4>GEX Dashboard</h4>
+
+  <!-- GEX form -->
+  <form method="post" class="row g-3 mb-3">
+    <div class="col-auto">
+      <label class="form-label">Ticker</label>
+      <input class="form-control" name="ticker" value="{{ ticker or 'SPX' }}">
+    </div>
+    <div class="col-auto">
+      <label class="form-label">Expiry (YYYY-MM-DD)</label>
+      <input class="form-control" name="expiry" value="{{ expiry }}">
+    </div>
+    <div class="col-auto">
+      <label class="form-label">Price Override</label>
+      <input class="form-control" name="price_override" value="">
+    </div>
+    <div class="col-auto align-self-end">
+      <button type="submit" class="btn btn-primary">Run</button>
+    </div>
+  </form>
+
+  {% if error %}
+    <div class="alert alert-danger">{{ error }}</div>
+  {% endif %}
+
+  {% if result %}
+    <!-- Ticker info -->
+    {% if result.ticker_data %}
+      <div class="mb-2">
+        <strong>Ticker:</strong> {{ result.ticker_data.symbol or 'SPX' }} |
+        <strong>Price:</strong> {{ "%.2f"|format(result.ticker_data.price) if result.ticker_data.price is number else result.ticker_data.price }} |
+        <strong>Bid:</strong> {{ result.ticker_data.bid }} |
+        <strong>Ask:</strong> {{ result.ticker_data.ask }}
+      </div>
+    {% endif %}
+
+    <!-- Zero-gamma strikes -->
+    {% if result.zero_gamma_strikes %}
+      {% set zgs_sorted = (result.zero_gamma_strikes | map('float') | list) | sort %}
+      <div class="mb-2">
+        <strong>Zero Gamma Strikes:</strong>
+        {{ zgs_sorted | map('int') | list | join(', ') }}
+      </div>
+    {% endif %}
+
+    <!-- Key Levels full table -->
+    {% if result.key_levels %}
+      <div class="mt-3">
+        <strong>Top {{ result.key_levels|length }} Strikes by GEX Magnitude (sorted by strike):</strong>
+        <div class="table-responsive">
+          <table class="table table-sm table-striped align-middle mt-2">
+            <thead>
+              <tr>
+                <th>Strike</th>
+                <th>Total GEX</th>
+                <th>Call GEX</th>
+                <th>Put GEX</th>
+                <th>Distance</th>
+                <th>Level Type</th>
+              </tr>
+            </thead>
+            <tbody>
+              {% for lvl in result.key_levels %}
+                <tr>
+                  <td>{{ "%.1f"|format(lvl.strike) }}</td>
+                  <td>{{ lvl.total_gex }}</td>
+                  <td>{{ lvl.call_gex }}</td>
+                  <td>{{ lvl.put_gex }}</td>
+                  <td>
+                    {{ lvl.distance }}
+                    ({{ "+" if lvl.distance > 0 else "" }}{{ "%.1f"|format(lvl.distance_pct) }}%)
+                  </td>
+                  <td>{{ lvl.level_type }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    {% endif %}
+
+    <!-- Calls / Puts table -->
+    <div class="table-responsive mt-4">
+      <table class="table table-sm table-striped align-middle">
+        <thead>
+          <tr>
+            <th colspan="8" class="text-center">Calls</th>
+            <th>Strike</th>
+            <th colspan="8" class="text-center">Puts</th>
+          </tr>
+          <tr>
+            <th>Mid</th><th>Bid</th><th>Ask</th><th>Vol</th><th>Δ</th><th>Γ</th><th>Θ</th><th>Vega</th>
+            <th></th>
+            <th>Mid</th><th>Bid</th><th>Ask</th><th>Vol</th><th>Δ</th><th>Γ</th><th>Θ</th><th>Vega</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for row in rows %}
+            {% set c = row.call %}
+            {% set p = row.put %}
+            <tr>
+              {% if c %}
+                <td>{{ "%.2f"|format(c.mid) if c.mid is number else '' }}</td>
+                <td>{{ "%.4f"|format(c.bid) if c.bid is number else '' }}</td>
+                <td>{{ "%.4f"|format(c.ask) if c.ask is number else '' }}</td>
+                <td>{{ "%.4f"|format(c.volatility) if c.volatility is number else '' }}</td>
+                <td>{{ "%.4f"|format(c.delta) if c.delta is number else '' }}</td>
+                <td>{{ "%.4f"|format(c.gamma) if c.gamma is number else '' }}</td>
+                <td>{{ "%.4f"|format(c.theta) if c.theta is number else '' }}</td>
+                <td>{{ "%.4f"|format(c.vega) if c.vega is number else '' }}</td>
+              {% else %}
+                <td colspan="8"></td>
+              {% endif %}
+
+              <td>{{ c.strike if c and c.strike is not none else (p.strike if p else '') }}</td>
+
+              {% if p %}
+                <td>{{ "%.2f"|format(p.mid) if p.mid is number else '' }}</td>
+                <td>{{ "%.4f"|format(p.bid) if p.bid is number else '' }}</td>
+                <td>{{ "%.4f"|format(p.ask) if p.ask is number else '' }}</td>
+                <td>{{ "%.4f"|format(p.volatility) if p.volatility is number else '' }}</td>
+                <td>{{ "%.4f"|format(p.delta) if p.delta is number else '' }}</td>
+                <td>{{ "%.4f"|format(p.gamma) if p.gamma is number else '' }}</td>
+                <td>{{ "%.4f"|format(p.theta) if p.theta is number else '' }}</td>
+                <td>{{ "%.4f"|format(p.vega) if p.vega is number else '' }}</td>
+              {% else %}
+                <td colspan="8"></td>
+              {% endif %}
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- GEX summary -->
+    {% if result.gex_summary %}
+      <div class="mt-3">
+        <strong>GEX Summary:</strong>
+        Call GEX: {{ result.gex_summary.call_gex }},
+        Put GEX: {{ result.gex_summary.put_gex }},
+        Net GEX: {{ result.gex_summary.net_gex }}
+      </div>
+    {% endif %}
+  {% endif %}
+{% endblock %}
