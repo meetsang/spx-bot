@@ -374,6 +374,7 @@ class StrategyState:
     closed_flies: Dict[float, IronFly] = field(default_factory=dict)
     per_if_pnl: Dict[float, float] = field(default_factory=dict)
     total_pnl: float = 0.0
+    realized_pnl: float = 0.0
 # =========================
 # Strategy class (Part 2/3)
 # =========================
@@ -417,7 +418,7 @@ class SPXIFStrategy:
         self.logger.info(f"State JSON: {self.state_path}")
         self.logger.info(f"Config: {vars(self.cfg)}")
 
-    # ---------- Logger setup ----------
+
     def setup_logger(self):
         self.logger = logging.getLogger(self.cfg.strategy_name)
         self.logger.setLevel(logging.INFO)
@@ -425,15 +426,24 @@ class SPXIFStrategy:
             log_path = os.path.join(self.strategy_folder, "strategy.log")
             fh = logging.FileHandler(log_path, encoding="utf-8")
             fh.setLevel(logging.INFO)
+
             fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+            # Force timestamp conversion to configured tz
+            def custom_time(*args):
+                return now_in_tz(self.cfg.tz_name).timetuple()
+            fmt.converter = custom_time
+            
             fh.setFormatter(fmt)
             self.logger.addHandler(fh)
 
-            # Console output as well
-            ch = logging.StreamHandler()
-            ch.setLevel(logging.INFO)
-            ch.setFormatter(fmt)
-            self.logger.addHandler(ch)
+        # Console handler
+        ch = logging.StreamHandler()
+        ch.setLevel(logging.INFO)
+        fmt_console = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+        fmt_console.converter = lambda *args: now_in_tz(self.cfg.tz_name).timetuple()
+        ch.setFormatter(fmt_console)
+        self.logger.addHandler(ch)
+
 
     def update_file_handler(self):
         """Re-point file handler to a new date folder after rollover."""
@@ -454,60 +464,55 @@ class SPXIFStrategy:
 
     # ---------- State persistence ----------
     def save_state(self):
-        """Persist current strategy state and config snapshot to state.json."""
         try:
-            cfg_snapshot = asdict(self.cfg)
-            # Convert enum to JSON-friendly
-            cfg_snapshot["tif"] = self.cfg.tif.value if hasattr(self.cfg.tif, "value") else str(self.cfg.tif)
-            payload = {
-                "timestamp": now_in_tz(self.cfg.tz_name).isoformat(),
-                "expiry": self.state.expiry,
-                "entered_today": self.state.entered_today,
-                "active_flies": [
+            state_path = os.path.join(self.strategy_folder, "state.json")
+            with open(state_path, "w", encoding="utf-8") as f:
+                json.dump(
                     {
-                        "body": body,
-                        "width": fly.width,
-                        "qty": fly.qty,
-                        "entry_credit": float(Decimal(fly.entry_credit).quantize(Decimal("0.01"))),
-                    }
-                    for body, fly in self.state.active_flies.items() if fly.open
-                ],
-                "closed_flies": sorted(list(self.state.closed_flies.keys())),
-                "total_pnl": float(Decimal(self.state.total_pnl).quantize(Decimal("0.01"))),
-                "config": cfg_snapshot,
-            }
-            with open(self.state_path, "w") as f:
-                json.dump(payload, f, indent=2)
+                        "entered_today": self.state.entered_today,
+                        "expiry": self.state.expiry,
+                        "active_flies": {body: asdict(fly) for body, fly in self.state.active_flies.items()},
+                        "closed_flies": {body: asdict(fly) for body, fly in self.state.closed_flies.items()},
+                        "per_if_pnl": self.state.per_if_pnl,
+                        "total_pnl": self.state.total_pnl,
+                        "realized_pnl": self.state.realized_pnl,  # <-- added
+                    },
+                    f,
+                    indent=2
+                )
         except Exception as e:
-            self.logger.error(f"Failed to save state: {e}", exc_info=True)
+            self.logger.error(f"Error saving state: {e}")
 
-    def load_state(self) -> Optional[dict]:
-        """
-        Load state from disk; if missing, auto-create a default empty state for today.
-        Returns loaded dict or None on unexpected error.
-        """
+
+    def load_state(self):
         try:
-            with open(self.state_path, "r") as f:
-                return json.load(f)
-        except FileNotFoundError:
-            # Auto-create a default state for today on first run
-            today_str = now_in_tz(self.cfg.tz_name).strftime("%Y-%m-%d")
-            self.state.expiry = today_str
-            self.state.entered_today = False
-            self.state.active_flies.clear()
-            self.state.closed_flies.clear()
-            self.state.total_pnl = 0.0
-            self.save_state()
-            self.logger.info("state.json not found; created a fresh default state.")
-            try:
-                with open(self.state_path, "r") as f:
-                    return json.load(f)
-            except Exception as e:
-                self.logger.error(f"Failed to read newly created state.json: {e}", exc_info=True)
-                return None
+            state_path = os.path.join(self.strategy_folder, "state.json")
+            if not os.path.exists(state_path):
+                return {}
+
+            with open(state_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            self.state.entered_today = data.get("entered_today", False)
+            self.state.expiry = data.get("expiry")
+            self.state.active_flies = {
+                float(body): IronFly(**fly) for body, fly in data.get("active_flies", {}).items()
+            }
+            self.state.closed_flies = {
+                float(body): IronFly(**fly) for body, fly in data.get("closed_flies", {}).items()
+            }
+            self.state.per_if_pnl = {float(k): float(v) for k, v in data.get("per_if_pnl", {}).items()}
+            self.state.total_pnl = data.get("total_pnl", 0.0)
+            self.state.realized_pnl = data.get("realized_pnl", 0.0)  # <-- added earlier
+
+            return data  # <-- return for rehydrate_from_state()
+
         except Exception as e:
-            self.logger.error(f"Failed to load state.json: {e}", exc_info=True)
-            return None
+            self.logger.error(f"Error loading state: {e}")
+            return {}
+
+
+
 
     # ---------- Entry/Exit/Status ----------
     def evaluate_entry_window(self) -> bool:
@@ -549,7 +554,8 @@ class SPXIFStrategy:
         PnL ≈ entry_credit − current_mid (debit to close).
         """
         per_if_pnl = {}
-        total = 0.0
+        unrealized_total = 0.0
+        # total = 0.0
         for body, fly in self.state.active_flies.items():
             if not fly.open:
                 continue
@@ -559,10 +565,11 @@ class SPXIFStrategy:
             pnl = float(fly.entry_credit) - float(current_mid)
             pnl = float(Decimal(pnl).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
             per_if_pnl[body] = pnl
-            total += pnl
-        total = float(Decimal(total).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            unrealized_total += pnl
+            # total += pnl
+        # total = float(Decimal(total).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
         self.state.per_if_pnl = per_if_pnl
-        self.state.total_pnl = total
+        self.state.total_pnl = float(Decimal(self.state.realized_pnl + unrealized_total).quantize(Decimal("0.01")))
 
     # ---------- Chain & expiry ----------
     def get_chain(self):
@@ -788,7 +795,10 @@ class SPXIFStrategy:
         if self.cfg.simulate_only:
             fly.open = False
             self.state.closed_flies[fly.body] = fly
-            self.logger.info(f"[SIM] Closed IF {fmt2(fly.body)} for debit ${fmt2(debit)}")
+            # Add closed trade’s realized PnL into running tally
+            pnl = fly.entry_credit - debit
+            self.state.realized_pnl += float(Decimal(pnl).quantize(Decimal("0.01")))
+            self.logger.info(f"[SIM] Closed IF {fmt2(fly.body)} for debit ${fmt2(debit)}, PnL={fmt2(pnl)}, RealizedTotal={fmt2(self.state.realized_pnl)}")
             return True
 
         # Live/dry-run order path
@@ -808,7 +818,10 @@ class SPXIFStrategy:
             self.account.place_order(self.session, order, dry_run=(self.cfg.dry_run if dry_run is None else dry_run))
             fly.open = False
             self.state.closed_flies[fly.body] = fly
-            self.logger.info(f"Closed IF {fmt2(fly.body)} for debit ${fmt2(debit)} dry={self.cfg.dry_run if dry_run is None else dry_run}")
+            # Add closed trade’s realized PnL into running tally
+            pnl = fly.entry_credit - debit
+            self.state.realized_pnl += float(Decimal(pnl).quantize(Decimal("0.01")))
+            self.logger.info(f"Closed IF {fmt2(fly.body)} for debit ${fmt2(debit)}, PnL={fmt2(pnl)}, RealizedTotal={fmt2(self.state.realized_pnl)} dry={self.cfg.dry_run if dry_run is None else dry_run}")
             return True
         except Exception as e:
             self.logger.error(f"Close IF {fmt2(fly.body)} failed: {e}", exc_info=True)
@@ -842,12 +855,29 @@ class SPXIFStrategy:
         """
         ts = now_in_tz(self.cfg.tz_name).isoformat()
         # Total strategy PnL
-        write_csv_row(self.pnl_strategy_path, ["ts", "strategy_total_pnl"],
-                      {"ts": ts, "strategy_total_pnl": fmt2(self.state.total_pnl)})
-        # Per-IF PnL
+        write_csv_row(
+            self.pnl_strategy_path,
+            ["ts", "strategy_total_pnl", "realized_pnl"],
+            {
+                "ts": ts,
+                "strategy_total_pnl": fmt2(self.state.total_pnl),
+                "realized_pnl": fmt2(self.state.realized_pnl),
+            }
+        )
+        # Per-IF PnL (unrealized) + include overall totals
         for body, pnl in sorted(self.state.per_if_pnl.items()):
-            write_csv_row(self.pnl_if_path, ["ts", "body", "pnl", "total_pnl"],
-                          {"ts": ts, "body": fmt2(body), "pnl": fmt2(pnl), "total_pnl": fmt2(self.state.total_pnl)})
+            write_csv_row(
+                self.pnl_if_path,
+                ["ts", "body", "pnl", "total_pnl", "realized_pnl"],
+                {
+                    "ts": ts,
+                    "body": fmt2(body),
+                    "pnl": fmt2(pnl),  # individual open IF pnl
+                    "total_pnl": fmt2(self.state.total_pnl),
+                    "realized_pnl": fmt2(self.state.realized_pnl),
+                }
+            )
+
 
     # ---------- Streaming and mark-to-market ----------
     async def stream_and_mark(self):
