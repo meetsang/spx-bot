@@ -375,6 +375,8 @@ class StrategyState:
     per_if_pnl: Dict[float, float] = field(default_factory=dict)
     total_pnl: float = 0.0
     realized_pnl: float = 0.0
+    min_net_pnl: float = 0.0
+    max_net_pnl: float = 0.0
 # =========================
 # Strategy class (Part 2/3)
 # =========================
@@ -462,51 +464,268 @@ class SPXIFStrategy:
         self.logger.addHandler(fh)
         self.logger.info(f"Log file handler updated: {new_path}")
 
+    # ---------- Option serialization helpers ----------
+    def serialize_option(self, option_obj) -> dict:
+        """Convert Option object to JSON-serializable dictionary"""
+        try:
+            if option_obj is None:
+                return {}
+            
+            # Extract only the essential attributes needed for reconstruction
+            serialized = {
+                "symbol": str(getattr(option_obj, 'symbol', '')),
+                "streamer_symbol": str(getattr(option_obj, 'streamer_symbol', '')),
+                "strike_price": float(getattr(option_obj, 'strike_price', 0.0)),
+                "option_type": str(getattr(option_obj, 'option_type', '')),
+                "expiration_date": str(getattr(option_obj, 'expiration_date', '')),
+                "underlying_symbol": str(getattr(option_obj, 'underlying_symbol', 'SPX')),
+            }
+            
+            # Ensure all values are JSON-serializable
+            for key, value in serialized.items():
+                if value is None:
+                    serialized[key] = ""
+                    
+            return serialized
+            
+        except Exception as e:
+            self.logger.error(f"Error serializing option: {e}")
+            # Return a minimal valid structure to prevent JSON errors
+            return {
+                "symbol": "",
+                "streamer_symbol": "",
+                "strike_price": 0.0,
+                "option_type": "",
+                "expiration_date": "",
+                "underlying_symbol": "SPX",
+            }
+
+    def deserialize_option(self, option_dict: dict, options_chain):
+        """Reconstruct Option object from dictionary using options chain"""
+        try:
+            if not option_dict:
+                return None
+            
+            # Find the matching option in the chain
+            strike = float(option_dict.get('strike_price', 0))
+            option_type = option_dict.get('option_type', '')
+            
+            for option in options_chain:
+                if (float(option.strike_price) == strike and 
+                    option.option_type == option_type):
+                    return option
+            
+            self.logger.warning(f"Could not find option in chain: strike={strike}, type={option_type}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Error deserializing option: {e}")
+            return None
+
+    def serialize_iron_fly(self, fly: IronFly) -> dict:
+        """Convert IronFly to JSON-serializable dictionary"""
+        try:
+            if fly is None:
+                return {}
+            
+            # Serialize each option leg with error handling
+            serialized = {
+                "body": float(fly.body),
+                "width": int(fly.width),
+                "qty": int(fly.qty),
+                "call_short_opt": self.serialize_option(fly.call_short_opt),
+                "call_long_opt": self.serialize_option(fly.call_long_opt),
+                "put_short_opt": self.serialize_option(fly.put_short_opt),
+                "put_long_opt": self.serialize_option(fly.put_long_opt),
+                "entry_credit": float(fly.entry_credit),
+                "open": bool(fly.open),
+            }
+            
+            # Verify all nested dictionaries are properly serialized
+            for key in ["call_short_opt", "call_long_opt", "put_short_opt", "put_long_opt"]:
+                if not isinstance(serialized[key], dict):
+                    self.logger.warning(f"Option serialization failed for {key}, using empty dict")
+                    serialized[key] = {}
+            
+            return serialized
+            
+        except Exception as e:
+            self.logger.error(f"Error serializing iron fly: {e}")
+            # Return a minimal valid structure to prevent JSON errors
+            return {
+                "body": 0.0,
+                "width": 0,
+                "qty": 0,
+                "call_short_opt": {},
+                "call_long_opt": {},
+                "put_short_opt": {},
+                "put_long_opt": {},
+                "entry_credit": 0.0,
+                "open": False,
+            }
+
+    def deserialize_iron_fly(self, fly_dict: dict, options_chain) -> Optional[IronFly]:
+        """Reconstruct IronFly from dictionary"""
+        try:
+            if not fly_dict:
+                return None
+            
+            call_short_opt = self.deserialize_option(fly_dict.get('call_short_opt', {}), options_chain)
+            call_long_opt = self.deserialize_option(fly_dict.get('call_long_opt', {}), options_chain)
+            put_short_opt = self.deserialize_option(fly_dict.get('put_short_opt', {}), options_chain)
+            put_long_opt = self.deserialize_option(fly_dict.get('put_long_opt', {}), options_chain)
+            
+            if None in (call_short_opt, call_long_opt, put_short_opt, put_long_opt):
+                self.logger.warning("Could not deserialize all option legs for iron fly")
+                return None
+            
+            return IronFly(
+                body=fly_dict.get('body', 0.0),
+                width=fly_dict.get('width', 0),
+                qty=fly_dict.get('qty', 0),
+                call_short_opt=call_short_opt,
+                call_long_opt=call_long_opt,
+                put_short_opt=put_short_opt,
+                put_long_opt=put_long_opt,
+                entry_credit=fly_dict.get('entry_credit', 0.0),
+                open=fly_dict.get('open', True),
+            )
+        except Exception as e:
+            self.logger.error(f"Error deserializing iron fly: {e}")
+            return None
+
     # ---------- State persistence ----------
+    def _create_base_state_dict(self) -> dict:
+        """Create base state dictionary with common fields to avoid duplication"""
+        return {
+            "entered_today": bool(self.state.entered_today),
+            "expiry": str(self.state.expiry) if self.state.expiry else None,
+            "total_pnl": float(self.state.total_pnl),
+            "realized_pnl": float(self.state.realized_pnl),
+            "min_net_pnl": float(self.state.min_net_pnl),
+            "max_net_pnl": float(self.state.max_net_pnl),
+        }
+
     def save_state(self):
+        """Save state with proper Option object serialization"""
         try:
             state_path = os.path.join(self.strategy_folder, "state.json")
+            
+            # Pre-serialize the flies to catch any serialization errors early
+            active_flies_serialized = {}
+            for body, fly in self.state.active_flies.items():
+                try:
+                    serialized_fly = self.serialize_iron_fly(fly)
+                    active_flies_serialized[str(body)] = serialized_fly
+                except Exception as e:
+                    self.logger.error(f"Failed to serialize active fly at body {body}: {e}")
+                    # Use empty structure to prevent JSON errors
+                    active_flies_serialized[str(body)] = {}
+            
+            closed_flies_serialized = {}
+            for body, fly in self.state.closed_flies.items():
+                try:
+                    serialized_fly = self.serialize_iron_fly(fly)
+                    closed_flies_serialized[str(body)] = serialized_fly
+                except Exception as e:
+                    self.logger.error(f"Failed to serialize closed fly at body {body}: {e}")
+                    # Use empty structure to prevent JSON errors
+                    closed_flies_serialized[str(body)] = {}
+            
+            # Create the complete state dictionary using base fields
+            state_dict = self._create_base_state_dict()
+            state_dict.update({
+                "active_flies": active_flies_serialized,
+                "closed_flies": closed_flies_serialized,
+                "per_if_pnl": {str(k): float(v) for k, v in self.state.per_if_pnl.items()},
+            })
+            
+            # Test JSON serialization before writing to file
+            json_str = json.dumps(state_dict, indent=2)
+            
+            # Write to file
             with open(state_path, "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "entered_today": self.state.entered_today,
-                        "expiry": self.state.expiry,
-                        "active_flies": {body: asdict(fly) for body, fly in self.state.active_flies.items()},
-                        "closed_flies": {body: asdict(fly) for body, fly in self.state.closed_flies.items()},
-                        "per_if_pnl": self.state.per_if_pnl,
-                        "total_pnl": self.state.total_pnl,
-                        "realized_pnl": self.state.realized_pnl,  # <-- added
-                    },
-                    f,
-                    indent=2
-                )
+                f.write(json_str)
+                
+            self.logger.info("State saved successfully with Option serialization")
+            
         except Exception as e:
             self.logger.error(f"Error saving state: {e}")
+            # Log additional details for debugging
+            self.logger.error(f"State details - entered_today: {self.state.entered_today}, expiry: {self.state.expiry}")
+            self.logger.error(f"Active flies count: {len(self.state.active_flies)}, Closed flies count: {len(self.state.closed_flies)}")
+            
+            # Try to save a minimal state to prevent complete failure
+            try:
+                # Use base state dict and add minimal required fields
+                minimal_state = self._create_base_state_dict()
+                minimal_state.update({
+                    "active_flies": {},
+                    "closed_flies": {},
+                    "per_if_pnl": {},
+                })
+                
+                state_path = os.path.join(self.strategy_folder, "state.json")
+                with open(state_path, "w", encoding="utf-8") as f:
+                    json.dump(minimal_state, f, indent=2)
+                    
+                self.logger.warning("Saved minimal state due to serialization errors")
+                
+            except Exception as fallback_error:
+                self.logger.error(f"Failed to save even minimal state: {fallback_error}")
 
 
     def load_state(self):
+        """Load state with proper Option object deserialization"""
         try:
             state_path = os.path.join(self.strategy_folder, "state.json")
             if not os.path.exists(state_path):
+                self.logger.info("No existing state file found, starting with empty state")
                 return {}
 
             with open(state_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
 
-            self.state.entered_today = data.get("entered_today", False)
+            # Load basic state fields with type conversion and validation
+            self.state.entered_today = bool(data.get("entered_today", False))
             self.state.expiry = data.get("expiry")
-            self.state.active_flies = {
-                float(body): IronFly(**fly) for body, fly in data.get("active_flies", {}).items()
-            }
-            self.state.closed_flies = {
-                float(body): IronFly(**fly) for body, fly in data.get("closed_flies", {}).items()
-            }
-            self.state.per_if_pnl = {float(k): float(v) for k, v in data.get("per_if_pnl", {}).items()}
-            self.state.total_pnl = data.get("total_pnl", 0.0)
-            self.state.realized_pnl = data.get("realized_pnl", 0.0)  # <-- added earlier
+            
+            # Load PnL data with proper type conversion
+            per_if_pnl_data = data.get("per_if_pnl", {})
+            self.state.per_if_pnl = {}
+            for k, v in per_if_pnl_data.items():
+                try:
+                    self.state.per_if_pnl[float(k)] = float(v)
+                except (ValueError, TypeError) as e:
+                    self.logger.warning(f"Invalid per_if_pnl entry {k}:{v}, skipping: {e}")
+            
+            self.state.total_pnl = float(data.get("total_pnl", 0.0))
+            self.state.realized_pnl = float(data.get("realized_pnl", 0.0))
+            
+            # Initialize min/max PnL fields for existing state files without these fields
+            self.state.min_net_pnl = float(data.get("min_net_pnl", 0.0))
+            self.state.max_net_pnl = float(data.get("max_net_pnl", 0.0))
+            
+            # If this is an existing state file without min/max fields, initialize them with current total_pnl
+            if "min_net_pnl" not in data or "max_net_pnl" not in data:
+                current_net_pnl = self.state.total_pnl
+                self.state.min_net_pnl = current_net_pnl
+                self.state.max_net_pnl = current_net_pnl
+                self.logger.info(f"Initialized min/max net PnL fields with current value: {fmt2(current_net_pnl)} SPX points")
 
-            return data  # <-- return for rehydrate_from_state()
+            # Clear active and closed flies - they will be rehydrated in rehydrate_from_state()
+            # This prevents issues with partially loaded Option objects
+            self.state.active_flies = {}
+            self.state.closed_flies = {}
 
+            # For Option object deserialization, we need the options chain
+            # This will be handled in rehydrate_from_state() method
+            self.logger.info("State loaded successfully, Option objects will be rehydrated when chain is available")
+            return data
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"Invalid JSON in state file: {e}")
+            self.logger.warning("Starting with empty state due to corrupted state file")
+            return {}
         except Exception as e:
             self.logger.error(f"Error loading state: {e}")
             return {}
@@ -548,10 +767,26 @@ class SPXIFStrategy:
 
         return to_close, False
 
+    def update_pnl_extremes(self, current_net_pnl: float) -> None:
+        """
+        Update min_net_pnl and max_net_pnl tracking based on current net PnL.
+        Net PnL = realized_pnl + unrealized_pnl
+        """
+        # Update minimum if current value is lower than stored minimum
+        if current_net_pnl < self.state.min_net_pnl:
+            self.state.min_net_pnl = current_net_pnl
+            self.logger.info(f"New minimum net PnL: {fmt2(current_net_pnl)} SPX points")
+        
+        # Update maximum if current value is higher than stored maximum
+        if current_net_pnl > self.state.max_net_pnl:
+            self.state.max_net_pnl = current_net_pnl
+            self.logger.info(f"New maximum net PnL: {fmt2(current_net_pnl)} SPX points")
+
     def compute_strategy_status(self, fly_mids: Dict[float, float]) -> None:
         """
         Compute per-IF and total PnL using current mid credits (SPX points):
         PnL ≈ entry_credit − current_mid (debit to close).
+        Also updates min/max net PnL tracking.
         """
         per_if_pnl = {}
         unrealized_total = 0.0
@@ -570,6 +805,10 @@ class SPXIFStrategy:
         # total = float(Decimal(total).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
         self.state.per_if_pnl = per_if_pnl
         self.state.total_pnl = float(Decimal(self.state.realized_pnl + unrealized_total).quantize(Decimal("0.01")))
+        
+        # Calculate net PnL (realized + unrealized) and update extremes
+        net_pnl = self.state.total_pnl  # total_pnl already includes realized + unrealized
+        self.update_pnl_extremes(net_pnl)
 
     # ---------- Chain & expiry ----------
     def get_chain(self):
@@ -989,7 +1228,7 @@ class SPXIFStrategy:
     # ---------- State rehydration ----------
     def rehydrate_from_state(self, chain):
         """
-        Restore active IFs from state.json; auto-creates if missing.
+        Restore active IFs from state.json using proper Option object deserialization.
         Only 0DTE is used; expiry must match today; else treat as empty.
         """
         data = self.load_state()
@@ -998,8 +1237,9 @@ class SPXIFStrategy:
 
         today_str = now_in_tz(self.cfg.tz_name).strftime("%Y-%m-%d")
         expiry_str = data.get("expiry")
-        active = data.get("active_flies", [])
-        entered_today = bool(active) and expiry_str == today_str
+        active_flies_data = data.get("active_flies", {})
+        closed_flies_data = data.get("closed_flies", {})
+        entered_today = bool(active_flies_data) and expiry_str == today_str
 
         if not entered_today:
             self.state.entered_today = False
@@ -1018,29 +1258,38 @@ class SPXIFStrategy:
             return
 
         options = chain[expiry_date]
-        restored = 0
-        for item in active:
-            body = float(item["body"])
-            width = int(item["width"])
-            qty = int(item["qty"])
-            entry_credit = float(item.get("entry_credit", 0.0))
-            try:
-                cs_opt, cl_opt, ps_opt, pl_opt = self.build_if_options(options, body, width)
-                fly = IronFly(
-                    body=body, width=width, qty=qty,
-                    call_short_opt=cs_opt, call_long_opt=cl_opt,
-                    put_short_opt=ps_opt, put_long_opt=pl_opt,
-                    entry_credit=entry_credit,
-                    open=True
-                )
-                self.state.active_flies[body] = fly
-                restored += 1
-            except StopIteration:
-                self.logger.error(f"Could not rehydrate fly at body {fmt2(body)} (legs not found).")
+        restored_active = 0
+        restored_closed = 0
 
-        self.state.entered_today = restored > 0
+        # Restore active flies using new deserialization
+        for body_str, fly_data in active_flies_data.items():
+            try:
+                fly = self.deserialize_iron_fly(fly_data, options)
+                if fly is not None:
+                    body = float(body_str)
+                    self.state.active_flies[body] = fly
+                    restored_active += 1
+                else:
+                    self.logger.error(f"Could not deserialize active fly at body {body_str}")
+            except Exception as e:
+                self.logger.error(f"Error deserializing active fly at body {body_str}: {e}")
+
+        # Restore closed flies using new deserialization
+        for body_str, fly_data in closed_flies_data.items():
+            try:
+                fly = self.deserialize_iron_fly(fly_data, options)
+                if fly is not None:
+                    body = float(body_str)
+                    self.state.closed_flies[body] = fly
+                    restored_closed += 1
+                else:
+                    self.logger.error(f"Could not deserialize closed fly at body {body_str}")
+            except Exception as e:
+                self.logger.error(f"Error deserializing closed fly at body {body_str}: {e}")
+
+        self.state.entered_today = restored_active > 0
         self.state.expiry = expiry_str
-        self.logger.info(f"Rehydrated {restored} active IFs from state.json (expiry {expiry_str}).")
+        self.logger.info(f"Rehydrated {restored_active} active IFs and {restored_closed} closed IFs from state.json (expiry {expiry_str}).")
 
     # ---------- Strategy loop ----------
     async def run(self):

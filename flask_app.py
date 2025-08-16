@@ -1,4 +1,4 @@
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, send_file, abort
 import os, json
 import pandas as pd
 from datetime import datetime
@@ -19,6 +19,212 @@ STATE_JSON_NAME = "state.json"
 
 
 SPX_PRICE_COL_CANDIDATES = ["spx", "close", "price", "SPX"]
+
+# ---------- Chart Data Preparation Functions ----------
+def prepare_spx_data(date: str) -> pd.DataFrame:
+    """
+    Parse spx.csv and extract time/mark price data.
+    Returns DataFrame with 'Time' and 'Mark Price' columns.
+    """
+    spx_path = os.path.join(DATA_BASE_DIR, date, SPX_CSV_NAME)
+    
+    if not os.path.exists(spx_path):
+        return pd.DataFrame()
+    
+    try:
+        df = pd.read_csv(spx_path)
+        
+        # Validate required columns exist
+        if 'Time' not in df.columns:
+            print(f"Warning: 'Time' column not found in {spx_path}")
+            return pd.DataFrame()
+        
+        # Handle Mark Price column - calculate from bid/ask if Mark Price is empty or missing
+        mark_price_col = None
+        if 'Mark Price' in df.columns and not df['Mark Price'].isna().all():
+            mark_price_col = 'Mark Price'
+        elif 'Bid Price' in df.columns and 'Ask Price' in df.columns:
+            # Calculate mark price from bid/ask
+            bid_prices = pd.to_numeric(df['Bid Price'], errors='coerce')
+            ask_prices = pd.to_numeric(df['Ask Price'], errors='coerce')
+            df['Mark Price'] = (bid_prices + ask_prices) / 2
+            mark_price_col = 'Mark Price'
+        
+        if mark_price_col is None:
+            print(f"Warning: No price data found in {spx_path}")
+            return pd.DataFrame()
+        
+        # Convert Time to datetime and clean data
+        df['Time'] = pd.to_datetime(df['Time'], errors='coerce')
+        df = df.dropna(subset=['Time', mark_price_col])
+        
+        # Return only the columns we need
+        return df[['Time', mark_price_col]].copy()
+        
+    except Exception as e:
+        print(f"Error reading SPX data from {spx_path}: {e}")
+        return pd.DataFrame()
+
+
+def prepare_pnl_data(date: str) -> pd.DataFrame:
+    """
+    Parse pnl.csv and organize by fly body.
+    Returns DataFrame with 'ts', 'body', 'pnl', 'total_pnl', 'realized_pnl' columns.
+    """
+    pnl_path = os.path.join(DATA_BASE_DIR, date, STRATEGY_FOLDER, PNL_IF_CSV_NAME)
+    
+    if not os.path.exists(pnl_path):
+        return pd.DataFrame()
+    
+    try:
+        df = pd.read_csv(pnl_path)
+        
+        # Validate required columns exist
+        required_cols = ['ts', 'body', 'pnl']
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            print(f"Warning: Missing columns {missing_cols} in {pnl_path}")
+            return pd.DataFrame()
+        
+        # Convert timestamp and clean data
+        df['ts'] = pd.to_datetime(df['ts'], errors='coerce')
+        df = df.dropna(subset=['ts', 'body', 'pnl'])
+        
+        # Ensure numeric columns are properly typed
+        df['body'] = pd.to_numeric(df['body'], errors='coerce')
+        df['pnl'] = pd.to_numeric(df['pnl'], errors='coerce')
+        
+        if 'total_pnl' in df.columns:
+            df['total_pnl'] = pd.to_numeric(df['total_pnl'], errors='coerce')
+        if 'realized_pnl' in df.columns:
+            df['realized_pnl'] = pd.to_numeric(df['realized_pnl'], errors='coerce')
+        
+        return df.dropna(subset=['body', 'pnl'])
+        
+    except Exception as e:
+        print(f"Error reading PnL data from {pnl_path}: {e}")
+        return pd.DataFrame()
+
+
+def get_current_pnl(date: str) -> float:
+    """
+    Extract latest total PnL including realized losses.
+    Returns the most recent total_pnl value from pnl.csv.
+    """
+    pnl_df = prepare_pnl_data(date)
+    
+    if pnl_df.empty or 'total_pnl' not in pnl_df.columns:
+        return 0.0
+    
+    try:
+        # Get the latest timestamp and corresponding total_pnl
+        latest_row = pnl_df.loc[pnl_df['ts'].idxmax()]
+        return float(latest_row['total_pnl'])
+    except Exception as e:
+        print(f"Error extracting current PnL for {date}: {e}")
+        return 0.0
+
+
+def format_spx_trace(spx_df: pd.DataFrame) -> dict:
+    """
+    Structure SPX data for Plotly.
+    Returns a Plotly trace dictionary for SPX price data.
+    """
+    if spx_df.empty:
+        return {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "SPX",
+            "x": [],
+            "y": [],
+            "line": {"color": "#1f77b4", "width": 2},
+            "yaxis": "y"
+        }
+    
+    try:
+        # Use the Mark Price column (should be available after prepare_spx_data)
+        price_col = 'Mark Price'
+        if price_col not in spx_df.columns:
+            print("Warning: Mark Price column not found in SPX data")
+            return {"type": "scatter", "mode": "lines", "name": "SPX", "x": [], "y": []}
+        
+        return {
+            "type": "scatter",
+            "mode": "lines",
+            "name": "SPX",
+            "x": spx_df['Time'].dt.strftime('%H:%M:%S').tolist(),
+            "y": spx_df[price_col].tolist(),
+            "line": {"color": "#1f77b4", "width": 2},
+            "yaxis": "y"
+        }
+    except Exception as e:
+        print(f"Error formatting SPX trace: {e}")
+        return {"type": "scatter", "mode": "lines", "name": "SPX", "x": [], "y": []}
+
+
+def format_fly_traces(pnl_df: pd.DataFrame) -> list:
+    """
+    Structure individual fly PnL data with color coding.
+    Returns a list of Plotly trace dictionaries for each fly position.
+    """
+    if pnl_df.empty:
+        return []
+    
+    # Enhanced color palette for 9 fly positions with distinct, vibrant colors
+    color_palette = [
+        "#FF6B6B",  # Red
+        "#4ECDC4",  # Teal
+        "#45B7D1",  # Blue
+        "#96CEB4",  # Green
+        "#FFEAA7",  # Yellow
+        "#DDA0DD",  # Plum
+        "#98D8C8",  # Mint
+        "#F7DC6F",  # Light Yellow
+        "#BB8FCE"   # Light Purple
+    ]
+    
+    traces = []
+    
+    try:
+        # Get unique fly bodies (strike prices) and sort them
+        bodies = sorted(pnl_df['body'].unique())
+        
+        for idx, body in enumerate(bodies):
+            # Filter data for this specific fly
+            fly_data = pnl_df[pnl_df['body'] == body].sort_values('ts')
+            
+            if fly_data.empty:
+                continue
+            
+            # Create trace for this fly
+            trace = {
+                "type": "scatter",
+                "mode": "lines+markers",
+                "name": f"IF {body:.0f}",
+                "x": fly_data['ts'].dt.strftime('%H:%M:%S').tolist(),
+                "y": fly_data['pnl'].tolist(),
+                "line": {
+                    "color": color_palette[idx % len(color_palette)], 
+                    "width": 2
+                },
+                "marker": {
+                    "size": 4,
+                    "color": color_palette[idx % len(color_palette)]
+                },
+                "yaxis": "y2",
+                "hovertemplate": f"<b>IF {body:.0f}</b><br>" +
+                               "Time: %{x}<br>" +
+                               "PnL: %{y:.2f}<br>" +
+                               "<extra></extra>"
+            }
+            traces.append(trace)
+            
+    except Exception as e:
+        print(f"Error formatting fly traces: {e}")
+        return []
+    
+    return traces
+
 
 # ---------- Helpers ----------
 def normalize_key_levels(result: dict) -> dict:
@@ -152,6 +358,47 @@ def find_spx_price_column(df: pd.DataFrame) -> str:
 def strategy_folder_exists(date_str: str) -> bool:
     return os.path.isdir(os.path.join(DATA_BASE_DIR, date_str, STRATEGY_FOLDER))
 
+def generate_download_url(date: str, file_type: str) -> str:
+    """Generate download URL for specific date and file type"""
+    return f"/download/{date}/{file_type}"
+
+def validate_download_request(date: str, file_type: str) -> tuple[bool, str, str]:
+    """
+    Validate download request parameters and return (is_valid, file_path, error_message)
+    """
+    # Validate date format
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
+        return False, "", "Invalid date format. Expected YYYY-MM-DD."
+    
+    # Validate file_type
+    allowed_file_types = ["pnl", "quotes"]
+    if file_type not in allowed_file_types:
+        return False, "", f"Invalid file type. Allowed types: {', '.join(allowed_file_types)}"
+    
+    # Map file_type to actual filename
+    file_mapping = {
+        "pnl": PNL_IF_CSV_NAME,
+        "quotes": "quotes.csv"
+    }
+    
+    filename = file_mapping[file_type]
+    file_path = os.path.join(DATA_BASE_DIR, date, STRATEGY_FOLDER, filename)
+    
+    # Security check: ensure the resolved path is within DATA_BASE_DIR
+    abs_data_dir = os.path.abspath(DATA_BASE_DIR)
+    abs_file_path = os.path.abspath(file_path)
+    
+    if not abs_file_path.startswith(abs_data_dir):
+        return False, "", "Invalid file path."
+    
+    # Check if file exists
+    if not os.path.exists(file_path):
+        return False, "", f"File {filename} not found for date {date}."
+    
+    return True, file_path, ""
+
 # ---------- Routes ----------
 @app.route("/", methods=["GET", "POST"])
 @app.route("/gex", methods=["GET", "POST"])
@@ -187,7 +434,7 @@ def gex():
 def strategy():
     dates = list_available_dates()
     if not dates:
-        return render_template("strategy.html",
+        return render_template("SPX_9IF_0DTE.html",
                                active_tab="strategy",
                                dates=[],
                                selected_date="",
@@ -201,88 +448,110 @@ def strategy():
 
     selected_date = request.args.get("date") or dates[0]
 
-    # SPX
-    spx_path = os.path.join(DATA_BASE_DIR, selected_date, SPX_CSV_NAME)
-    spx_df = load_csv_if_exists(spx_path)
+    # Prepare chart data using new functions
+    spx_df = prepare_spx_data(selected_date)
+    pnl_df = prepare_pnl_data(selected_date)
+    current_pnl = get_current_pnl(selected_date)
+    
     spx_available = not spx_df.empty
+    strategy_found = strategy_folder_exists(selected_date)
 
+    # Create chart traces
     traces = []
+    
+    # Add SPX trace
+    if spx_available:
+        spx_trace = format_spx_trace(spx_df)
+        if spx_trace.get('x'):  # Only add if we have data
+            traces.append(spx_trace)
+    
+    # Add fly traces
+    if strategy_found and not pnl_df.empty:
+        fly_traces = format_fly_traces(pnl_df)
+        traces.extend(fly_traces)
+
+    # Chart layout with proper dual y-axis configuration and current PnL display
     layout = {
-        "title": f"SPX and Strategy PnL — {selected_date}",
-        "xaxis": {"title": "Time"},
-        "yaxis": {"title": "SPX"},
-        "yaxis2": {"title": "PnL (SPX points)", "overlaying": "y", "side": "right"},
-        "legend": {"orientation": "h"},
-        "margin": {"l": 60, "r": 60, "t": 50, "b": 50}
+        "title": {
+            "text": f"SPX and Strategy PnL — {selected_date}",
+            "x": 0.5,
+            "xanchor": "center"
+        },
+        "xaxis": {
+            "title": "Time",
+            "type": "category",
+            "tickangle": -45
+        },
+        "yaxis": {
+            "title": "SPX Price",
+            "side": "left",
+            "showgrid": True,
+            "zeroline": False
+        },
+        "yaxis2": {
+            "title": "PnL (SPX points)",
+            "overlaying": "y",
+            "side": "right",
+            "showgrid": False,
+            "zeroline": True,
+            "zerolinecolor": "rgba(0,0,0,0.3)",
+            "zerolinewidth": 1
+        },
+        "legend": {
+            "orientation": "h",
+            "yanchor": "bottom",
+            "y": 1.02,
+            "xanchor": "right",
+            "x": 1
+        },
+        "margin": {"l": 80, "r": 80, "t": 80, "b": 80},
+        "hovermode": "x unified",
+        "showlegend": True,
+        "annotations": [
+            {
+                "text": f"Current PnL: {current_pnl:.2f}",
+                "xref": "paper",
+                "yref": "paper",
+                "x": 0.02,
+                "y": 0.98,
+                "xanchor": "left",
+                "yanchor": "top",
+                "showarrow": False,
+                "font": {
+                    "size": 16, 
+                    "color": "red" if current_pnl < 0 else "green",
+                    "family": "Arial, sans-serif"
+                },
+                "bgcolor": "rgba(255,255,255,0.9)",
+                "bordercolor": "red" if current_pnl < 0 else "green",
+                "borderwidth": 2,
+                "borderpad": 4
+            }
+        ] if current_pnl != 0.0 else []
     }
 
-    if spx_available:
-        x_spx = spx_df["ts"].astype(str).tolist() if "ts" in spx_df.columns else list(range(len(spx_df)))
-        spx_col = find_spx_price_column(spx_df)
-        if spx_col:
-            traces.append({
-                "type": "scatter",
-                "mode": "lines",
-                "name": "SPX",
-                "x": x_spx,
-                "y": spx_df[spx_col].tolist(),
-                "line": {"color": "#1f77b4", "width": 2},
-                "yaxis": "y"
-            })
-
-    # Strategy overlays (if present)
-    strategy_found = strategy_folder_exists(selected_date)
+    # Raw file displays for debugging
     status_text = ""
     pnl_if_text = ""
-
     if strategy_found:
         strat_dir = os.path.join(DATA_BASE_DIR, selected_date, STRATEGY_FOLDER)
-        pnl_if_df = load_csv_if_exists(os.path.join(strat_dir, PNL_IF_CSV_NAME))
-        pnl_strat_df = load_csv_if_exists(os.path.join(strat_dir, PNL_STRAT_CSV_NAME))
-
-        palette = [
-            "#d62728", "#2ca02c", "#ff7f0e", "#9467bd", "#8c564b",
-            "#e377c2", "#7f7f7f", "#bcbd22", "#17becf", "#000000"
-        ]
-
-        if not pnl_if_df.empty and "body" in pnl_if_df.columns:
-            try:
-                bodies = sorted(pnl_if_df["body"].unique().tolist())
-            except Exception:
-                bodies = []
-            for idx, body in enumerate(bodies):
-                sub = pnl_if_df[pnl_if_df["body"] == body].sort_values("ts")
-                x = sub["ts"].astype(str).tolist() if "ts" in sub.columns else list(range(len(sub)))
-                y = sub["pnl"].astype(float).tolist() if "pnl" in sub.columns else []
-                traces.append({
-                    "type": "scatter",
-                    "mode": "lines",
-                    "name": f"IF {body}",
-                    "x": x,
-                    "y": y,
-                    "line": {"color": palette[idx % len(palette)], "width": 1.5},
-                    "yaxis": "y2"
-                })
-
-        if not pnl_strat_df.empty and "strategy_total_pnl" in pnl_strat_df.columns:
-            sub = pnl_strat_df.sort_values("ts")
-            x = sub["ts"].astype(str).tolist() if "ts" in sub.columns else list(range(len(sub)))
-            y = sub["strategy_total_pnl"].astype(float).tolist()
-            traces.append({
-                "type": "scatter",
-                "mode": "lines",
-                "name": "Strategy PnL",
-                "x": x,
-                "y": y,
-                "line": {"color": palette[-1], "width": 2.5},
-                "yaxis": "y2"
-            })
-
-        # Raw file displays
         status_text = read_text_if_exists(os.path.join(strat_dir, STATE_JSON_NAME))
         pnl_if_text = read_text_if_exists(os.path.join(strat_dir, PNL_IF_CSV_NAME))
 
-    return render_template("strategy.html",
+    # Generate download URLs for the template
+    pnl_download_url = generate_download_url(selected_date, "pnl") if strategy_found else None
+    quotes_download_url = generate_download_url(selected_date, "quotes") if strategy_found else None
+    
+    # Check if files actually exist for download buttons
+    pnl_file_exists = False
+    quotes_file_exists = False
+    if strategy_found:
+        pnl_path = os.path.join(DATA_BASE_DIR, selected_date, STRATEGY_FOLDER, PNL_IF_CSV_NAME)
+        quotes_path = os.path.join(DATA_BASE_DIR, selected_date, STRATEGY_FOLDER, "quotes.csv")
+        pnl_file_exists = os.path.exists(pnl_path)
+        quotes_file_exists = os.path.exists(quotes_path)
+
+    return render_template("SPX_9IF_0DTE.html",
                            active_tab="strategy",
                            dates=dates,
                            selected_date=selected_date,
@@ -292,7 +561,38 @@ def strategy():
                            strategy_found=strategy_found,
                            status_text=status_text,
                            pnl_if_text=pnl_if_text,
-                           spx_path_display=spx_path)
+                           spx_path_display=os.path.join(DATA_BASE_DIR, selected_date, SPX_CSV_NAME),
+                           pnl_download_url=pnl_download_url,
+                           quotes_download_url=quotes_download_url,
+                           pnl_file_exists=pnl_file_exists,
+                           quotes_file_exists=quotes_file_exists)
+
+@app.route("/download/<date>/<file_type>")
+def download_file(date: str, file_type: str):
+    """Serve CSV files for download with proper validation and error handling"""
+    
+    # Validate the download request
+    is_valid, file_path, error_message = validate_download_request(date, file_type)
+    
+    if not is_valid:
+        abort(404, description=error_message)
+    
+    try:
+        # Generate appropriate filename for download
+        file_mapping = {
+            "pnl": f"pnl_{date}.csv",
+            "quotes": f"quotes_{date}.csv"
+        }
+        download_name = file_mapping.get(file_type, f"{file_type}_{date}.csv")
+        
+        return send_file(
+            file_path,
+            as_attachment=True,
+            download_name=download_name,
+            mimetype='text/csv'
+        )
+    except Exception as e:
+        abort(500, description=f"Error serving file: {str(e)}")
 
 if __name__ == "__main__":
     # If running standalone (not via main.py), start the server
